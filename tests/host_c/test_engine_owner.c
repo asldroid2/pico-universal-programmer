@@ -33,10 +33,24 @@ static int g_drain_calls = 0;
 static int g_tristate_calls = 0;
 static int g_swio_pu_calls = 0;
 static int g_vtarg_calls = 0;
+static int g_hal_depth = 0;
+static int g_max_hal_depth = 0;
 static bool g_swio_pu_enabled = false;
 static bool g_vtarg_enabled = false;
 static hal_event_t g_events[MAX_HAL_EVENTS];
 static size_t g_event_count = 0u;
+
+static void enter_hal_cb(void) {
+    ++g_hal_depth;
+    if (g_hal_depth > g_max_hal_depth) {
+        g_max_hal_depth = g_hal_depth;
+    }
+}
+
+static void leave_hal_cb(void) {
+    assert(g_hal_depth > 0);
+    --g_hal_depth;
+}
 
 static void record_event(hal_event_t ev) {
     assert(g_event_count < MAX_HAL_EVENTS);
@@ -48,6 +62,8 @@ static void reset_hal_spy(bool initial_vtarg) {
     g_tristate_calls = 0;
     g_swio_pu_calls = 0;
     g_vtarg_calls = 0;
+    g_hal_depth = 0;
+    g_max_hal_depth = 0;
     g_swio_pu_enabled = false;
     g_vtarg_enabled = initial_vtarg;
     memset(g_events, 0, sizeof(g_events));
@@ -55,25 +71,33 @@ static void reset_hal_spy(bool initial_vtarg) {
 }
 
 static void fake_drain_pio(void) {
+    enter_hal_cb();
     ++g_drain_calls;
     record_event(HAL_EVENT_DRAIN_PIO);
+    leave_hal_cb();
 }
 
 static void fake_tristate_debug_pins(void) {
+    enter_hal_cb();
     ++g_tristate_calls;
     record_event(HAL_EVENT_TRISTATE);
+    leave_hal_cb();
 }
 
 static void fake_set_swio_pullup(bool enabled) {
+    enter_hal_cb();
     ++g_swio_pu_calls;
     g_swio_pu_enabled = enabled;
     record_event(enabled ? HAL_EVENT_SWIO_PU_ON : HAL_EVENT_SWIO_PU_OFF);
+    leave_hal_cb();
 }
 
 static void fake_set_vtarg_power(bool enabled) {
+    enter_hal_cb();
     ++g_vtarg_calls;
     g_vtarg_enabled = enabled;
     record_event(enabled ? HAL_EVENT_VTARG_ON : HAL_EVENT_VTARG_OFF);
+    leave_hal_cb();
 }
 
 static const pu_pin_hal_t kFullHal = {
@@ -194,20 +218,28 @@ static void test_engine_owner_fault_latch_survives_usb_reset_and_tick_until_clea
     assert(g_swio_pu_enabled == true);
     assert(g_vtarg_enabled == true);
 
-    /* Zero fault mask must be ignored without disturbing active owner. */
+    /* Zero fault mask must fail-safe to PU_FAULT_UNSPECIFIED and cut VTARG power. */
     pu_engine_latch_fault(0u);
-    assert(pu_engine_current() == PU_ENGINE_SWIO);
-    assert(pu_engine_fault_mask() == 0u);
-    assert(g_swio_pu_enabled == true);
-    assert(g_vtarg_enabled == true);
-    assert(g_event_count == 1u);
+    assert(pu_engine_current() == PU_ENGINE_FAULT);
+    assert(pu_engine_fault_mask() == PU_FAULT_UNSPECIFIED);
+    assert(pu_engine_fault_mask() != 0u);
+    assert(g_swio_pu_enabled == false);
+    assert(g_vtarg_enabled == false);
+    assert(g_event_count == 5u);
+    assert(g_events[1] == HAL_EVENT_DRAIN_PIO);
+    assert(g_events[2] == HAL_EVENT_TRISTATE);
+    assert(g_events[3] == HAL_EVENT_SWIO_PU_OFF);
+    assert(g_events[4] == HAL_EVENT_VTARG_OFF);
+    assert(pu_engine_clear_fault() == PU_OK);
 
     /* Non-zero fault mask executes immediate ordered shutdown including VTARG power-off. */
     reset_hal_spy(true);
+    assert(pu_engine_acquire(PU_ENGINE_SWIO, 1500u, 500000u) == PU_OK);
+    reset_hal_spy(true);
     g_swio_pu_enabled = true;
-    pu_engine_latch_fault(0x01u);
+    pu_engine_latch_fault(PU_FAULT_OVERCURRENT);
     assert(pu_engine_current() == PU_ENGINE_FAULT);
-    assert(pu_engine_fault_mask() == 0x01u);
+    assert(pu_engine_fault_mask() == PU_FAULT_OVERCURRENT);
     assert(g_swio_pu_enabled == false);
     assert(g_vtarg_enabled == false);
     assert(g_event_count == 4u);
@@ -217,9 +249,10 @@ static void test_engine_owner_fault_latch_survives_usb_reset_and_tick_until_clea
     assert(g_events[3] == HAL_EVENT_VTARG_OFF);
 
     /* Subsequent fault bits accumulate via bitwise OR. */
-    pu_engine_latch_fault(0x04u);
+    pu_engine_latch_fault(PU_FAULT_WATCHDOG | PU_FAULT_WIRE_STALL);
     assert(pu_engine_current() == PU_ENGINE_FAULT);
-    assert(pu_engine_fault_mask() == 0x05u);
+    assert(pu_engine_fault_mask() ==
+           (PU_FAULT_OVERCURRENT | PU_FAULT_WATCHDOG | PU_FAULT_WIRE_STALL));
 
     /* All valid engine acquisitions must fail with PU_ERR_FAULT_LATCHED without touching HAL. */
     size_t events_before = g_event_count;
@@ -235,7 +268,8 @@ static void test_engine_owner_fault_latch_survives_usb_reset_and_tick_until_clea
     pu_engine_on_usb_reset();
     pu_engine_tick(9999999u);
     assert(pu_engine_current() == PU_ENGINE_FAULT);
-    assert(pu_engine_fault_mask() == 0x05u);
+    assert(pu_engine_fault_mask() ==
+           (PU_FAULT_OVERCURRENT | PU_FAULT_WATCHDOG | PU_FAULT_WIRE_STALL));
     assert(g_event_count == events_before);
 
     /* Explicit clear_fault transitions FAULT -> IDLE and clears fault_mask. */
@@ -389,21 +423,27 @@ static pu_status_t g_nested_acquire_status = PU_OK;
 static pu_status_t g_nested_clear_status = PU_OK;
 
 static void drain_with_concurrent_acquire_attempt(void) {
+    enter_hal_cb();
     ++g_drain_calls;
     /* Simulates Core 0 attempting acquire/clear_fault while Core 1 is mid-teardown. */
     g_nested_acquire_status = pu_engine_acquire(PU_ENGINE_JTAG, 5000u, 1000u);
     g_nested_clear_status = pu_engine_clear_fault();
+    leave_hal_cb();
 }
 
 static void swio_pu_with_concurrent_overcurrent_irq(bool enabled) {
+    enter_hal_cb();
     ++g_swio_pu_calls;
     if (enabled) {
         /* Simulates VTARG_FAULT_N IRQ firing on Core 0 before Core 1 finishes GPIO setup. */
         pu_engine_latch_fault(0x20u);
         g_swio_pu_enabled = true;
+        record_event(HAL_EVENT_SWIO_PU_ON);
     } else {
         g_swio_pu_enabled = false;
+        record_event(HAL_EVENT_SWIO_PU_OFF);
     }
+    leave_hal_cb();
 }
 
 static void test_engine_owner_inflight_teardown_and_irq_preemption_safety(void) {
@@ -419,6 +459,7 @@ static void test_engine_owner_inflight_teardown_and_irq_preemption_safety(void) 
     assert(pu_engine_release(PU_ENGINE_SWD) == PU_OK);
     assert(g_nested_acquire_status == PU_ERR_ENGINE_BUSY);
     assert(g_nested_clear_status == PU_ERR_ENGINE_BUSY);
+    assert(g_max_hal_depth == 1);
     assert(pu_engine_current() == PU_ENGINE_IDLE);
     assert(pu_engine_acquire(PU_ENGINE_JTAG, 6000u, 10000u) == PU_OK);
     assert(pu_engine_release(PU_ENGINE_JTAG) == PU_OK);
@@ -434,8 +475,249 @@ static void test_engine_owner_inflight_teardown_and_irq_preemption_safety(void) 
     assert(pu_engine_acquire(PU_ENGINE_SWIO, 2000u, 10000u) == PU_ERR_FAULT_LATCHED);
     assert(pu_engine_current() == PU_ENGINE_FAULT);
     assert(pu_engine_fault_mask() == 0x20u);
+    assert(g_max_hal_depth == 1);
     assert(g_swio_pu_enabled == false);
     assert(g_vtarg_enabled == false);
+    assert(g_event_count == 5u);
+    assert(g_events[0] == HAL_EVENT_SWIO_PU_ON);
+    assert(g_events[1] == HAL_EVENT_DRAIN_PIO);
+    assert(g_events[2] == HAL_EVENT_TRISTATE);
+    assert(g_events[3] == HAL_EVENT_SWIO_PU_OFF);
+    assert(g_events[4] == HAL_EVENT_VTARG_OFF);
+    assert(pu_engine_clear_fault() == PU_OK);
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+}
+
+static void swio_pu_with_concurrent_usb_reset(bool enabled) {
+    enter_hal_cb();
+    ++g_swio_pu_calls;
+    record_event(enabled ? HAL_EVENT_SWIO_PU_ON : HAL_EVENT_SWIO_PU_OFF);
+    if (enabled) {
+        g_swio_pu_enabled = true;
+        pu_engine_on_usb_reset();
+    } else {
+        g_swio_pu_enabled = false;
+    }
+    leave_hal_cb();
+}
+
+static void swio_pu_with_concurrent_deadline_tick(bool enabled) {
+    enter_hal_cb();
+    ++g_swio_pu_calls;
+    record_event(enabled ? HAL_EVENT_SWIO_PU_ON : HAL_EVENT_SWIO_PU_OFF);
+    if (enabled) {
+        g_swio_pu_enabled = true;
+        pu_engine_tick(6000u);
+    } else {
+        g_swio_pu_enabled = false;
+    }
+    leave_hal_cb();
+}
+
+static void swio_pu_with_reset_then_zero_fault(bool enabled) {
+    enter_hal_cb();
+    ++g_swio_pu_calls;
+    record_event(enabled ? HAL_EVENT_SWIO_PU_ON : HAL_EVENT_SWIO_PU_OFF);
+    if (enabled) {
+        g_swio_pu_enabled = true;
+        pu_engine_on_usb_reset();
+        pu_engine_latch_fault(0u);
+    } else {
+        g_swio_pu_enabled = false;
+    }
+    leave_hal_cb();
+}
+
+static void test_engine_owner_swio_acquire_preempted_by_reset_or_tick_never_returns_ok(void) {
+    /* USB reset arriving during set_swio_pullup(true) must abort acquire and tear down cleanly. */
+    reset_hal_spy(true);
+    const pu_pin_hal_t reset_race_hal = {
+        .drain_pio = fake_drain_pio,
+        .tristate_debug_pins = fake_tristate_debug_pins,
+        .set_swio_pullup = swio_pu_with_concurrent_usb_reset,
+        .set_vtarg_power = fake_set_vtarg_power,
+    };
+    pu_engine_init(&reset_race_hal);
+    pu_status_t rc_reset = pu_engine_acquire(PU_ENGINE_SWIO, 1000u, 500000u);
+    assert(rc_reset != PU_OK);
+    assert(rc_reset == PU_ERR_ENGINE_BUSY || rc_reset == PU_ERR_TIMEOUT);
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+    assert(g_max_hal_depth == 1);
+    assert(g_swio_pu_enabled == false);
+    assert(g_vtarg_enabled == true);
+    assert(g_event_count == 4u);
+    assert(g_events[0] == HAL_EVENT_SWIO_PU_ON);
+    assert(g_events[1] == HAL_EVENT_DRAIN_PIO);
+    assert(g_events[2] == HAL_EVENT_TRISTATE);
+    assert(g_events[3] == HAL_EVENT_SWIO_PU_OFF);
+
+    /* Wire deadline tick arriving during set_swio_pullup(true) must abort acquire and tear down. */
+    reset_hal_spy(true);
+    const pu_pin_hal_t tick_race_hal = {
+        .drain_pio = fake_drain_pio,
+        .tristate_debug_pins = fake_tristate_debug_pins,
+        .set_swio_pullup = swio_pu_with_concurrent_deadline_tick,
+        .set_vtarg_power = fake_set_vtarg_power,
+    };
+    pu_engine_init(&tick_race_hal);
+    pu_status_t rc_tick = pu_engine_acquire(PU_ENGINE_SWIO, 1000u, 5000u);
+    assert(rc_tick != PU_OK);
+    assert(rc_tick == PU_ERR_ENGINE_BUSY || rc_tick == PU_ERR_TIMEOUT);
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+    assert(g_max_hal_depth == 1);
+    assert(g_swio_pu_enabled == false);
+    assert(g_vtarg_enabled == true);
+    assert(g_event_count == 4u);
+    assert(g_events[0] == HAL_EVENT_SWIO_PU_ON);
+    assert(g_events[1] == HAL_EVENT_DRAIN_PIO);
+    assert(g_events[2] == HAL_EVENT_TRISTATE);
+    assert(g_events[3] == HAL_EVENT_SWIO_PU_OFF);
+
+    /* USB reset + fault(0) during set_swio_pullup(true) coalesce into one fault teardown. */
+    reset_hal_spy(true);
+    const pu_pin_hal_t reset_fault_hal = {
+        .drain_pio = fake_drain_pio,
+        .tristate_debug_pins = fake_tristate_debug_pins,
+        .set_swio_pullup = swio_pu_with_reset_then_zero_fault,
+        .set_vtarg_power = fake_set_vtarg_power,
+    };
+    pu_engine_init(&reset_fault_hal);
+    assert(pu_engine_acquire(PU_ENGINE_SWIO, 1000u, 500000u) == PU_ERR_FAULT_LATCHED);
+    assert(pu_engine_current() == PU_ENGINE_FAULT);
+    assert(pu_engine_fault_mask() == PU_FAULT_UNSPECIFIED);
+    assert(g_max_hal_depth == 1);
+    assert(g_drain_calls == 1);
+    assert(g_swio_pu_enabled == false);
+    assert(g_vtarg_enabled == false);
+    assert(pu_engine_clear_fault() == PU_OK);
+}
+
+static pu_engine_state_t g_state_during_drain = PU_ENGINE_IDLE;
+static pu_status_t g_acquire_during_drain = PU_OK;
+static pu_status_t g_renew_during_drain = PU_OK;
+static pu_status_t g_release_during_drain = PU_OK;
+
+static void drain_observing_mid_teardown_state(void) {
+    enter_hal_cb();
+    ++g_drain_calls;
+    record_event(HAL_EVENT_DRAIN_PIO);
+    g_state_during_drain = pu_engine_current();
+    g_acquire_during_drain = pu_engine_acquire(PU_ENGINE_RECOVERY, 9000u, 1000u);
+    g_renew_during_drain = pu_engine_renew_deadline(g_state_during_drain, 9000u, 50000u);
+    g_release_during_drain = pu_engine_release(g_state_during_drain);
+    /* Concurrent USB reset and tick mid-teardown must be idempotent no-ops. */
+    pu_engine_on_usb_reset();
+    pu_engine_tick(999999u);
+    leave_hal_cb();
+}
+
+static void test_engine_owner_does_not_publish_idle_before_teardown_completes(void) {
+    const pu_pin_hal_t observe_hal = {
+        .drain_pio = drain_observing_mid_teardown_state,
+        .tristate_debug_pins = fake_tristate_debug_pins,
+        .set_swio_pullup = fake_set_swio_pullup,
+        .set_vtarg_power = fake_set_vtarg_power,
+    };
+    pu_engine_init(&observe_hal);
+
+    /* 1. pu_engine_release() must keep active owner visible until teardown finishes. */
+    reset_hal_spy(true);
+    assert(pu_engine_acquire(PU_ENGINE_SWD, 1000u, 50000u) == PU_OK);
+    assert(pu_engine_release(PU_ENGINE_SWD) == PU_OK);
+    assert(g_state_during_drain == PU_ENGINE_SWD);
+    assert(g_state_during_drain != PU_ENGINE_IDLE);
+    assert(g_acquire_during_drain == PU_ERR_ENGINE_BUSY);
+    assert(g_renew_during_drain == PU_ERR_NOT_OWNER);
+    assert(g_release_during_drain == PU_ERR_NOT_OWNER);
+    assert(g_max_hal_depth == 1);
+    assert(g_drain_calls == 1);
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+
+    /* 2. pu_engine_tick() must keep active owner visible until teardown finishes. */
+    reset_hal_spy(true);
+    assert(pu_engine_acquire(PU_ENGINE_JTAG, 2000u, 10000u) == PU_OK);
+    pu_engine_tick(12000u);
+    assert(g_state_during_drain == PU_ENGINE_JTAG);
+    assert(g_state_during_drain != PU_ENGINE_IDLE);
+    assert(g_acquire_during_drain == PU_ERR_ENGINE_BUSY);
+    assert(g_renew_during_drain == PU_ERR_NOT_OWNER);
+    assert(g_release_during_drain == PU_ERR_NOT_OWNER);
+    assert(g_max_hal_depth == 1);
+    assert(g_drain_calls == 1);
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+
+    /* 3. pu_engine_on_usb_reset() must keep active owner visible until teardown finishes. */
+    reset_hal_spy(true);
+    assert(pu_engine_acquire(PU_ENGINE_SWIO, 3000u, 10000u) == PU_OK);
+    pu_engine_on_usb_reset();
+    assert(g_state_during_drain == PU_ENGINE_SWIO);
+    assert(g_state_during_drain != PU_ENGINE_IDLE);
+    assert(g_acquire_during_drain == PU_ERR_ENGINE_BUSY);
+    assert(g_renew_during_drain == PU_ERR_NOT_OWNER);
+    assert(g_release_during_drain == PU_ERR_NOT_OWNER);
+    assert(g_max_hal_depth == 1);
+    assert(g_drain_calls == 1);
+    assert(g_swio_pu_enabled == false);
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+}
+
+static void drain_latching_wire_stall_fault(void) {
+    enter_hal_cb();
+    ++g_drain_calls;
+    /* Guard against unbounded recursion so an unfixed bug fails deterministically. */
+    assert(g_drain_calls <= 4);
+    record_event(HAL_EVENT_DRAIN_PIO);
+    pu_engine_latch_fault(PU_FAULT_WIRE_STALL);
+    leave_hal_cb();
+}
+
+static void test_engine_owner_fault_inside_drain_pio_coalesces_without_recursion(void) {
+    const pu_pin_hal_t fault_in_drain_hal = {
+        .drain_pio = drain_latching_wire_stall_fault,
+        .tristate_debug_pins = fake_tristate_debug_pins,
+        .set_swio_pullup = fake_set_swio_pullup,
+        .set_vtarg_power = fake_set_vtarg_power,
+    };
+    pu_engine_init(&fault_in_drain_hal);
+
+    /*
+     * (a1) Direct pu_engine_latch_fault() where drain_pio() also calls pu_engine_latch_fault()
+     * must not recurse and must execute exactly one clean fault teardown cutting VTARG.
+     */
+    reset_hal_spy(true);
+    assert(pu_engine_acquire(PU_ENGINE_SWIO, 1000u, 50000u) == PU_OK);
+    assert(g_swio_pu_enabled == true);
+    pu_engine_latch_fault(PU_FAULT_OVERCURRENT);
+    assert(pu_engine_current() == PU_ENGINE_FAULT);
+    assert(pu_engine_fault_mask() == (PU_FAULT_OVERCURRENT | PU_FAULT_WIRE_STALL));
+    assert(g_max_hal_depth == 1);
+    assert(g_drain_calls == 1);
+    assert(g_tristate_calls == 1);
+    assert(g_swio_pu_calls == 2); /* 1 ON during acquire + 1 OFF during fault teardown */
+    assert(g_vtarg_calls == 1);
+    assert(g_swio_pu_enabled == false);
+    assert(g_vtarg_enabled == false);
+    assert(g_event_count == 5u);
+    assert(g_events[1] == HAL_EVENT_DRAIN_PIO);
+    assert(g_events[2] == HAL_EVENT_TRISTATE);
+    assert(g_events[3] == HAL_EVENT_SWIO_PU_OFF);
+    assert(g_events[4] == HAL_EVENT_VTARG_OFF);
+    assert(pu_engine_clear_fault() == PU_OK);
+
+    /*
+     * (a2) Normal release teardown whose drain_pio() latches a fault must not recurse,
+     * must run a coalesced fault teardown that cuts VTARG, and must stay in PU_ENGINE_FAULT.
+     */
+    reset_hal_spy(true);
+    assert(pu_engine_acquire(PU_ENGINE_SWD, 2000u, 50000u) == PU_OK);
+    assert(pu_engine_release(PU_ENGINE_SWD) == PU_OK);
+    assert(pu_engine_current() == PU_ENGINE_FAULT);
+    assert(pu_engine_fault_mask() == PU_FAULT_WIRE_STALL);
+    assert(g_max_hal_depth == 1);
+    assert(g_vtarg_calls == 1);
+    assert(g_vtarg_enabled == false);
+    assert(g_swio_pu_enabled == false);
+    assert(pu_engine_acquire(PU_ENGINE_SWD, 3000u, 50000u) == PU_ERR_FAULT_LATCHED);
     assert(pu_engine_clear_fault() == PU_OK);
     assert(pu_engine_current() == PU_ENGINE_IDLE);
 }
@@ -448,6 +730,9 @@ int main(void) {
     test_engine_owner_renew_deadline_and_u64_overflow_safety();
     test_engine_owner_null_hal_and_partial_hal_callbacks_safe();
     test_engine_owner_inflight_teardown_and_irq_preemption_safety();
-    printf("test_engine_owner: all 7 test suites passed\n");
+    test_engine_owner_swio_acquire_preempted_by_reset_or_tick_never_returns_ok();
+    test_engine_owner_does_not_publish_idle_before_teardown_completes();
+    test_engine_owner_fault_inside_drain_pio_coalesces_without_recursion();
+    printf("test_engine_owner: all 10 test suites passed\n");
     return 0;
 }

@@ -12,13 +12,57 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wundef"
 #endif
+#include "hardware/claim.h"
 #include "hardware/sync.h"
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
-#ifndef PU_ENGINE_SPINLOCK_ID
-#define PU_ENGINE_SPINLOCK_ID PICO_SPINLOCK_ID_STRIPED_FIRST
-#endif
+
+static int s_spinlock_num = -1;
+
+static spin_lock_t *engine_spinlock(void) {
+    int lock_num = *(volatile const int *)&s_spinlock_num;
+    if (__builtin_expect(lock_num >= 0, 1)) {
+        __mem_fence_acquire();
+        return spin_lock_instance((uint)lock_num);
+    }
+
+    /*
+     * Lazily claim one exclusive hardware spinlock for the firmware lifetime.
+     * spin_lock_claim_unused() and spin_lock_unclaim() internally acquire
+     * hw_claim_lock(), so call them outside our hw_claim_lock() section to
+     * prevent same-core spinlock deadlock while keeping local IRQs masked.
+     */
+    uint32_t irq_save = save_and_disable_interrupts();
+    uint32_t claim_irq = hw_claim_lock();
+    lock_num = s_spinlock_num;
+    hw_claim_unlock(claim_irq);
+
+    if (lock_num < 0) {
+        int candidate = spin_lock_claim_unused(true);
+        (void)spin_lock_init((uint)candidate);
+
+        claim_irq = hw_claim_lock();
+        if (s_spinlock_num < 0) {
+            __mem_fence_release();
+            *(volatile int *)&s_spinlock_num = candidate;
+            __mem_fence_release();
+            lock_num = candidate;
+            candidate = -1;
+        } else {
+            lock_num = s_spinlock_num;
+        }
+        hw_claim_unlock(claim_irq);
+
+        if (candidate >= 0) {
+            spin_lock_unclaim((uint)candidate);
+        }
+    }
+
+    restore_interrupts(irq_save);
+    __mem_fence_acquire();
+    return spin_lock_instance((uint)lock_num);
+}
 #endif
 
 static pu_pin_hal_t s_hal;
@@ -26,11 +70,16 @@ static pu_engine_state_t s_state = PU_ENGINE_IDLE;
 static uint64_t s_deadline_us = 0u;
 static uint32_t s_fault_mask = 0u;
 static uint32_t s_epoch = 0u;
-static uint32_t s_hal_inflight = 0u;
+static bool s_hal_running = false;
+static bool s_teardown_pending = false;
+static bool s_cut_vtarg_pending = false;
+static bool s_target_idle_after_teardown = false;
 
 static inline uint32_t engine_lock(void) {
 #if !defined(PU_HOST_TEST)
-    return spin_lock_blocking(spin_lock_instance(PU_ENGINE_SPINLOCK_ID));
+    uint32_t saved_irq = save_and_disable_interrupts();
+    spin_lock_unsafe_blocking(engine_spinlock());
+    return saved_irq;
 #else
     return 0u;
 #endif
@@ -38,7 +87,7 @@ static inline uint32_t engine_lock(void) {
 
 static inline void engine_unlock(uint32_t saved_irq) {
 #if !defined(PU_HOST_TEST)
-    spin_unlock(spin_lock_instance(PU_ENGINE_SPINLOCK_ID), saved_irq);
+    spin_unlock(engine_spinlock(), saved_irq);
 #else
     (void)saved_irq;
 #endif
@@ -82,6 +131,58 @@ static void run_teardown_callbacks(const pu_pin_hal_t *hal, bool cut_vtarg_power
     }
 }
 
+/*
+ * Executes coalesced pending teardown passes as the sole active HAL runner.
+ * Bounded to at most 2 passes (e.g., upgrading an in-flight non-fault teardown
+ * to a VTARG-cutting fault teardown); once a fault teardown pass completes
+ * while s_hal_running blocks all acquires, re-latching inside drain_pio() stops.
+ */
+static void finish_hal_runner_locked(uint32_t *irq_state) {
+    bool completed_fault_teardown = false;
+
+    for (unsigned pass = 0u; pass < 2u && s_teardown_pending; ++pass) {
+        bool cut_vtarg = s_cut_vtarg_pending || (s_state == PU_ENGINE_FAULT);
+        s_teardown_pending = false;
+        s_cut_vtarg_pending = false;
+        if (cut_vtarg && completed_fault_teardown) {
+            break;
+        }
+        pu_pin_hal_t hal = s_hal;
+        engine_unlock(*irq_state);
+
+        run_teardown_callbacks(&hal, cut_vtarg);
+
+        *irq_state = engine_lock();
+        if (cut_vtarg) {
+            completed_fault_teardown = true;
+        }
+    }
+
+    s_teardown_pending = false;
+    s_cut_vtarg_pending = false;
+    if (s_target_idle_after_teardown && s_state != PU_ENGINE_FAULT) {
+        s_state = PU_ENGINE_IDLE;
+        s_deadline_us = 0u;
+    }
+    s_target_idle_after_teardown = false;
+    s_hal_running = false;
+}
+
+static void schedule_or_run_idle_teardown_locked(uint32_t irq_state) {
+    s_deadline_us = 0u;
+    ++s_epoch;
+    s_teardown_pending = true;
+    s_target_idle_after_teardown = true;
+    if (s_hal_running) {
+        engine_unlock(irq_state);
+        return;
+    }
+
+    s_hal_running = true;
+    finish_hal_runner_locked(&irq_state);
+    engine_unlock(irq_state);
+}
+
 void pu_engine_init(const pu_pin_hal_t *hal) {
     uint32_t irq_state = engine_lock();
     if (hal != NULL) {
@@ -93,7 +194,10 @@ void pu_engine_init(const pu_pin_hal_t *hal) {
     s_deadline_us = 0u;
     s_fault_mask = 0u;
     ++s_epoch;
-    s_hal_inflight = 0u;
+    s_hal_running = false;
+    s_teardown_pending = false;
+    s_cut_vtarg_pending = false;
+    s_target_idle_after_teardown = false;
     engine_unlock(irq_state);
 }
 
@@ -107,7 +211,7 @@ pu_status_t pu_engine_acquire(pu_engine_state_t target, uint64_t now_us, uint32_
         engine_unlock(irq_state);
         return PU_ERR_FAULT_LATCHED;
     }
-    if (s_state != PU_ENGINE_IDLE || s_hal_inflight != 0u) {
+    if (s_state != PU_ENGINE_IDLE || s_hal_running || s_teardown_pending) {
         engine_unlock(irq_state);
         return PU_ERR_ENGINE_BUSY;
     }
@@ -117,42 +221,31 @@ pu_status_t pu_engine_acquire(pu_engine_state_t target, uint64_t now_us, uint32_
     uint32_t acquire_epoch = ++s_epoch;
     pu_pin_hal_t hal = s_hal;
     bool enable_swio_pu = (target == PU_ENGINE_SWIO && hal.set_swio_pullup != NULL);
-    if (enable_swio_pu) {
-        ++s_hal_inflight;
+    if (!enable_swio_pu) {
+        engine_unlock(irq_state);
+        return PU_OK;
     }
+
+    s_hal_running = true;
     engine_unlock(irq_state);
 
-    if (enable_swio_pu) {
-        hal.set_swio_pullup(true);
+    hal.set_swio_pullup(true);
 
-        /* Re-check epoch in case a fault IRQ or USB reset preempted pull-up activation. */
-        irq_state = engine_lock();
-        bool preempted = (s_epoch != acquire_epoch);
-        bool faulted = (s_state == PU_ENGINE_FAULT);
-        if (!preempted && s_hal_inflight > 0u) {
-            --s_hal_inflight;
-        }
-        engine_unlock(irq_state);
-
-        if (preempted) {
-            if (hal.tristate_debug_pins != NULL) {
-                hal.tristate_debug_pins();
-            }
-            hal.set_swio_pullup(false);
-
-            irq_state = engine_lock();
-            if (s_hal_inflight > 0u) {
-                --s_hal_inflight;
-            }
-            faulted = (s_state == PU_ENGINE_FAULT);
-            engine_unlock(irq_state);
-
-            if (faulted) {
-                return PU_ERR_FAULT_LATCHED;
-            }
+    irq_state = engine_lock();
+    if (s_epoch != acquire_epoch && !s_teardown_pending) {
+        s_teardown_pending = true;
+        if (s_state == PU_ENGINE_FAULT) {
+            s_cut_vtarg_pending = true;
         }
     }
+    finish_hal_runner_locked(&irq_state);
+    bool preempted = (s_epoch != acquire_epoch);
+    bool faulted = (s_state == PU_ENGINE_FAULT);
+    engine_unlock(irq_state);
 
+    if (preempted) {
+        return faulted ? PU_ERR_FAULT_LATCHED : PU_ERR_ENGINE_BUSY;
+    }
     return PU_OK;
 }
 
@@ -168,7 +261,7 @@ pu_status_t pu_engine_renew_deadline(pu_engine_state_t expected_owner,
         engine_unlock(irq_state);
         return PU_ERR_FAULT_LATCHED;
     }
-    if (s_state != expected_owner) {
+    if (s_state != expected_owner || s_target_idle_after_teardown) {
         engine_unlock(irq_state);
         return PU_ERR_NOT_OWNER;
     }
@@ -184,94 +277,53 @@ pu_status_t pu_engine_release(pu_engine_state_t expected_owner) {
     }
 
     uint32_t irq_state = engine_lock();
-    if (s_state != expected_owner) {
+    if (s_state != expected_owner || s_target_idle_after_teardown) {
         engine_unlock(irq_state);
         return PU_ERR_NOT_OWNER;
     }
 
-    s_state = PU_ENGINE_IDLE;
-    s_deadline_us = 0u;
-    ++s_epoch;
-    ++s_hal_inflight;
-    pu_pin_hal_t hal = s_hal;
-    engine_unlock(irq_state);
-
-    run_teardown_callbacks(&hal, false);
-
-    irq_state = engine_lock();
-    if (s_hal_inflight > 0u) {
-        --s_hal_inflight;
-    }
-    engine_unlock(irq_state);
+    schedule_or_run_idle_teardown_locked(irq_state);
     return PU_OK;
 }
 
 void pu_engine_tick(uint64_t now_us) {
     uint32_t irq_state = engine_lock();
-    if (!is_acquirable_engine(s_state) || !is_deadline_expired(now_us, s_deadline_us)) {
+    if (!is_acquirable_engine(s_state) || s_target_idle_after_teardown ||
+        !is_deadline_expired(now_us, s_deadline_us)) {
         engine_unlock(irq_state);
         return;
     }
 
-    s_state = PU_ENGINE_IDLE;
-    s_deadline_us = 0u;
-    ++s_epoch;
-    ++s_hal_inflight;
-    pu_pin_hal_t hal = s_hal;
-    engine_unlock(irq_state);
-
-    run_teardown_callbacks(&hal, false);
-
-    irq_state = engine_lock();
-    if (s_hal_inflight > 0u) {
-        --s_hal_inflight;
-    }
-    engine_unlock(irq_state);
+    schedule_or_run_idle_teardown_locked(irq_state);
 }
 
 void pu_engine_on_usb_reset(void) {
     uint32_t irq_state = engine_lock();
-    if (!is_acquirable_engine(s_state)) {
+    if (!is_acquirable_engine(s_state) || s_target_idle_after_teardown) {
         engine_unlock(irq_state);
         return;
     }
 
-    s_state = PU_ENGINE_IDLE;
-    s_deadline_us = 0u;
-    ++s_epoch;
-    ++s_hal_inflight;
-    pu_pin_hal_t hal = s_hal;
-    engine_unlock(irq_state);
-
-    run_teardown_callbacks(&hal, false);
-
-    irq_state = engine_lock();
-    if (s_hal_inflight > 0u) {
-        --s_hal_inflight;
-    }
-    engine_unlock(irq_state);
+    schedule_or_run_idle_teardown_locked(irq_state);
 }
 
 void pu_engine_latch_fault(uint32_t fault_mask) {
-    if (fault_mask == 0u) {
-        return;
-    }
+    uint32_t effective_mask = (fault_mask != 0u) ? fault_mask : PU_FAULT_UNSPECIFIED;
 
     uint32_t irq_state = engine_lock();
     s_state = PU_ENGINE_FAULT;
     s_deadline_us = 0u;
-    s_fault_mask |= fault_mask;
+    s_fault_mask |= effective_mask;
     ++s_epoch;
-    ++s_hal_inflight;
-    pu_pin_hal_t hal = s_hal;
-    engine_unlock(irq_state);
-
-    run_teardown_callbacks(&hal, true);
-
-    irq_state = engine_lock();
-    if (s_hal_inflight > 0u) {
-        --s_hal_inflight;
+    s_teardown_pending = true;
+    s_cut_vtarg_pending = true;
+    if (s_hal_running) {
+        engine_unlock(irq_state);
+        return;
     }
+
+    s_hal_running = true;
+    finish_hal_runner_locked(&irq_state);
     engine_unlock(irq_state);
 }
 
@@ -284,7 +336,7 @@ uint32_t pu_engine_fault_mask(void) {
 
 pu_status_t pu_engine_clear_fault(void) {
     uint32_t irq_state = engine_lock();
-    if (s_hal_inflight != 0u || is_acquirable_engine(s_state)) {
+    if (s_hal_running || s_teardown_pending || is_acquirable_engine(s_state)) {
         engine_unlock(irq_state);
         return PU_ERR_ENGINE_BUSY;
     }

@@ -42,6 +42,11 @@ typedef enum {
     PU_ENGINE_FAULT = 5
 } pu_engine_state_t;
 
+#define PU_FAULT_OVERCURRENT  (1u << 0)
+#define PU_FAULT_WATCHDOG     (1u << 1)
+#define PU_FAULT_WIRE_STALL   (1u << 2)
+#define PU_FAULT_UNSPECIFIED  (1u << 31)
+
 typedef struct {
     void (*drain_pio)(void);
     void (*tristate_debug_pins)(void);
