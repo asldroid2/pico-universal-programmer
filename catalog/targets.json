@@ -64,8 +64,9 @@
       "mode": "cmsis-dap",
       "transport": "jtag",
       "target": "target/esp32.cfg",
+      "openocd_cfg": "catalog/openocd/pu-esp32.cfg",
       "tool_family": "esp32",
-      "speed_khz": 100
+      "speed_khz": 5000
     },
     "esp32s3": {
       "engine": "esp32",
@@ -77,8 +78,8 @@
     },
     "ch32v003": {
       "engine": "picorvd",
-      "mode": "picorvd",
-      "transport": "swd",
+      "mode": "composite-swio",
+      "transport": "swio",
       "tool_family": "riscv-gdb"
     }
   },

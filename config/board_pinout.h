@@ -23,7 +23,9 @@
 #define PU_USB_PID            0x0000u
 #endif
 
-#if (PU_USB_PID < 0) || (PU_USB_PID > 0xFFFFu)
+#if ((0 - PU_USB_PID - 1) == 1) && ((PU_USB_PID + 0) == 0)
+#error "PU_USB_PID must not be empty"
+#elif ((PU_USB_PID + 0) < 0) || ((PU_USB_PID + 0) > 0xFFFF)
 #error "PU_USB_PID must be a valid 16-bit USB Product ID"
 #endif
 
