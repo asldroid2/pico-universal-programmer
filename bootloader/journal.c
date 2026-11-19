@@ -5,15 +5,31 @@
 #include "bootloader/crc32.h"
 #include "config/flash_layout.h"
 
+enum {
+    PU_LAYOUT_FLASH_PAGE_SIZE = FLASH_PAGE_SIZE,
+    PU_LAYOUT_FLASH_SECTOR_SIZE = FLASH_SECTOR_SIZE,
+};
+
 #ifndef PU_HOST_TEST
-#define PU_LAYOUT_FLASH_PAGE_SIZE   FLASH_PAGE_SIZE
-#define PU_LAYOUT_FLASH_SECTOR_SIZE FLASH_SECTOR_SIZE
 #undef FLASH_PAGE_SIZE
 #undef FLASH_SECTOR_SIZE
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#if defined(__has_include)
+#if __has_include("pico/flash.h")
+#include "pico/flash.h"
+#define PU_HAS_PICO_FLASH 1
+#endif
+#endif
+#ifndef PU_HAS_PICO_FLASH
+#define PU_HAS_PICO_FLASH 0
+#endif
 _Static_assert(FLASH_PAGE_SIZE == PU_LAYOUT_FLASH_PAGE_SIZE, "SDK FLASH_PAGE_SIZE mismatch");
 _Static_assert(FLASH_SECTOR_SIZE == PU_LAYOUT_FLASH_SECTOR_SIZE, "SDK FLASH_SECTOR_SIZE mismatch");
+#endif
+
+#ifdef PICO_FLASH_SIZE_BYTES
+_Static_assert(PICO_FLASH_SIZE_BYTES >= (SLOT_JOURNAL_B_OFFSET + PU_LAYOUT_FLASH_SECTOR_SIZE), "PICO_FLASH_SIZE_BYTES must span both journal sectors");
 #endif
 
 /*
@@ -68,6 +84,29 @@ static const uint32_t kJournalOffsets[2] = {
     SLOT_JOURNAL_A_OFFSET,
     SLOT_JOURNAL_B_OFFSET,
 };
+
+#if PU_HAS_PICO_FLASH
+#define PU_FLASH_SAFE_TIMEOUT_MS (1000u)
+
+typedef struct {
+    uint32_t offset;
+} flash_erase_ctx_t;
+
+typedef struct {
+    uint32_t offset;
+    const uint8_t *page;
+} flash_program_ctx_t;
+
+static void flash_erase_bank_cb(void *param) {
+    const flash_erase_ctx_t *ctx = (const flash_erase_ctx_t *)param;
+    flash_range_erase(ctx->offset, FLASH_SECTOR_SIZE);
+}
+
+static void flash_program_page_cb(void *param) {
+    const flash_program_ctx_t *ctx = (const flash_program_ctx_t *)param;
+    flash_range_program(ctx->offset, ctx->page, FLASH_PAGE_SIZE);
+}
+#endif
 #endif
 
 static uint16_t read_u16_le(const uint8_t *p) {
@@ -234,6 +273,9 @@ static bool bank_is_fully_erased(unsigned bank) {
 }
 
 static bool flash_erase_bank(unsigned bank) {
+    if (bank >= 2u) {
+        return false;
+    }
 #ifdef PU_HOST_TEST
     uint8_t *dst = s_test_banks[bank];
     if (dst == NULL) {
@@ -249,6 +291,9 @@ static bool flash_erase_bank(unsigned bank) {
         dst[i] = 0xFFu;
     }
     return true;
+#elif PU_HAS_PICO_FLASH
+    flash_erase_ctx_t ctx = {.offset = kJournalOffsets[bank]};
+    return flash_safe_execute(flash_erase_bank_cb, &ctx, PU_FLASH_SAFE_TIMEOUT_MS) == PICO_OK;
 #else
     uint32_t irq_state = save_and_disable_interrupts();
     flash_range_erase(kJournalOffsets[bank], FLASH_SECTOR_SIZE);
@@ -258,7 +303,7 @@ static bool flash_erase_bank(unsigned bank) {
 }
 
 static bool flash_program_page(unsigned bank, uint32_t page_offset, const uint8_t page[FLASH_PAGE_SIZE]) {
-    if (page_offset >= FLASH_SECTOR_SIZE || (page_offset & (FLASH_PAGE_SIZE - 1u)) != 0u) {
+    if (bank >= 2u || page_offset >= FLASH_SECTOR_SIZE || (page_offset & (FLASH_PAGE_SIZE - 1u)) != 0u) {
         return false;
     }
 #ifdef PU_HOST_TEST
@@ -277,6 +322,12 @@ static bool flash_program_page(unsigned bank, uint32_t page_offset, const uint8_
         dst[page_offset + i] &= page[i];
     }
     return true;
+#elif PU_HAS_PICO_FLASH
+    flash_program_ctx_t ctx = {
+        .offset = kJournalOffsets[bank] + page_offset,
+        .page = page,
+    };
+    return flash_safe_execute(flash_program_page_cb, &ctx, PU_FLASH_SAFE_TIMEOUT_MS) == PICO_OK;
 #else
     uint32_t irq_state = save_and_disable_interrupts();
     flash_range_program(kJournalOffsets[bank] + page_offset, page, FLASH_PAGE_SIZE);
@@ -419,28 +470,50 @@ pu_boot_decision_t pu_bootloader_select_slot(bool recovery_button_pressed) {
                                     ? state.active_slot
                                     : (uint8_t)(trial_slot ^ 1u);
 
+        pu_image_info_t trial_info;
         if (state.boot_attempts < PU_JOURNAL_MAX_BOOT_ATTEMPTS &&
-            pu_image_validate_slot(slot_addr_for_id(trial_slot), slot_size_for_id(trial_slot), &decision.image_info)) {
-            state.pending_slot = trial_slot;
-            state.boot_attempts = (uint8_t)(state.boot_attempts + 1u);
-            state.flags |= PU_JOURNAL_FLAG_TRIAL;
-            decision.journal_updated = pu_journal_commit(&state);
-            decision.action = PU_BOOT_ACTION_BOOT_SLOT;
-            decision.selected_slot = trial_slot;
-            return decision;
+            pu_image_validate_slot(slot_addr_for_id(trial_slot), slot_size_for_id(trial_slot), &trial_info)) {
+            pu_journal_state_t trial_next = state;
+            trial_next.pending_slot = trial_slot;
+            trial_next.boot_attempts = (uint8_t)(state.boot_attempts + 1u);
+            trial_next.flags |= PU_JOURNAL_FLAG_TRIAL;
+            decision.journal_updated = pu_journal_commit(&trial_next);
+            if (decision.journal_updated) {
+                decision.image_info = trial_info;
+                decision.action = PU_BOOT_ACTION_BOOT_SLOT;
+                decision.selected_slot = trial_slot;
+                return decision;
+            }
         }
 
-        /* Trial exhausted (boot_attempts >= 3) or pending image corrupt: roll back to fallback slot. */
-        state.active_slot = fallback_slot;
-        state.pending_slot = PU_SLOT_NONE;
-        state.boot_attempts = 0u;
-        state.flags = (uint8_t)((state.flags & ~PU_JOURNAL_FLAG_TRIAL) | PU_JOURNAL_FLAG_ROLLED_BACK);
-        decision.journal_updated = pu_journal_commit(&state);
-
-        if (pu_image_validate_slot(slot_addr_for_id(fallback_slot), slot_size_for_id(fallback_slot), &decision.image_info)) {
+        /*
+         * Trial exhausted (boot_attempts >= 3), pending image corrupt, or attempt commit failed:
+         * validate fallback_slot BEFORE clearing trial state so an invalid fallback never
+         * unlatches a 3-strike-rejected trial image across power cycles.
+         */
+        pu_image_info_t fallback_info;
+        if (pu_image_validate_slot(slot_addr_for_id(fallback_slot), slot_size_for_id(fallback_slot), &fallback_info)) {
+            pu_journal_state_t rb_state = state;
+            rb_state.active_slot = fallback_slot;
+            rb_state.pending_slot = PU_SLOT_NONE;
+            rb_state.boot_attempts = 0u;
+            rb_state.flags = (uint8_t)((state.flags & ~PU_JOURNAL_FLAG_TRIAL) | PU_JOURNAL_FLAG_ROLLED_BACK);
+            decision.journal_updated = pu_journal_commit(&rb_state);
+            decision.image_info = fallback_info;
             decision.action = PU_BOOT_ACTION_BOOT_SLOT;
             decision.selected_slot = fallback_slot;
             return decision;
+        }
+
+        if (state.boot_attempts >= PU_JOURNAL_MAX_BOOT_ATTEMPTS &&
+            ((state.flags & PU_JOURNAL_FLAG_TRIAL) == 0u ||
+             state.pending_slot != trial_slot ||
+             state.boot_attempts != PU_JOURNAL_MAX_BOOT_ATTEMPTS)) {
+            pu_journal_state_t latched = state;
+            latched.pending_slot = trial_slot;
+            latched.boot_attempts = PU_JOURNAL_MAX_BOOT_ATTEMPTS;
+            latched.flags |= PU_JOURNAL_FLAG_TRIAL;
+            decision.journal_updated = pu_journal_commit(&latched);
         }
         return decision;
     }

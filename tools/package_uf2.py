@@ -106,6 +106,54 @@ def _encode_uf2_block(target_addr: int, page: bytes, block_no: int, total_blocks
     return header + page + bytes(476 - UF2_PAYLOAD_BYTES) + struct.pack("<I", UF2_MAGIC_END)
 
 
+def _validate_cortex_m0_vectors(
+    vector_region: bytes,
+    *,
+    vector_addr: int,
+    code_limit_len: int,
+    label: str,
+) -> None:
+    """Validate RP2040 Cortex-M0+ initial MSP and Thumb Reset_Handler at vector_addr."""
+    initial_msp, entry_point = struct.unpack_from("<2I", vector_region, 0)
+    if not (PU_RP2040_SRAM_BASE < initial_msp <= PU_RP2040_SRAM_TOP) or (initial_msp & 0x7) != 0:
+        raise UF2PackageError(
+            f"{label}: invalid initial MSP 0x{initial_msp:08X}; expected 8-byte aligned SRAM in "
+            f"(0x{PU_RP2040_SRAM_BASE:08X}, 0x{PU_RP2040_SRAM_TOP:08X}]"
+        )
+    if (entry_point & 1) == 0:
+        raise UF2PackageError(f"{label}: entry point 0x{entry_point:08X} lacks Cortex-M0+ Thumb bit 0")
+
+    entry_addr = entry_point & ~1
+    if not (vector_addr + 8 <= entry_addr <= vector_addr + code_limit_len - 2):
+        raise UF2PackageError(
+            f"{label}: entry point 0x{entry_point:08X} is outside executable region "
+            f"[0x{vector_addr + 8:08X}, 0x{vector_addr + code_limit_len:08X})"
+        )
+
+    entry_off = entry_addr - vector_addr
+    if vector_region[entry_off : entry_off + 2] == b"\xFF\xFF":
+        raise UF2PackageError(f"{label}: entry point 0x{entry_point:08X} points to erased flash (0xFFFF)")
+
+
+def _validate_bootloader_image(boot_bytes: bytes | bytearray, *, part_base: int, part_size: int) -> None:
+    raw = bytes(boot_bytes)
+    if len(raw) < PU_IMAGE_HEADER_SIZE + 16:
+        raise UF2PackageError(
+            f"bootloader image at 0x{part_base:08X} is too small ({len(raw)} bytes) for boot2 + vectors"
+        )
+    if len(raw) > part_size:
+        raise UF2PackageError(
+            f"bootloader image at 0x{part_base:08X} ({len(raw)} bytes) exceeds partition size ({part_size} bytes)"
+        )
+    vec_region = raw[PU_IMAGE_HEADER_SIZE:]
+    _validate_cortex_m0_vectors(
+        vec_region,
+        vector_addr=part_base + PU_IMAGE_HEADER_SIZE,
+        code_limit_len=len(vec_region),
+        label="bootloader",
+    )
+
+
 def stamp_slot_descriptor(
     slot_bytes: bytes | bytearray,
     *,
@@ -119,50 +167,36 @@ def stamp_slot_descriptor(
         raise UF2PackageError(
             f"slot image at 0x{slot_addr:08X} is too small ({len(raw)} bytes) for header + vectors"
         )
-    if len(raw) > slot_size:
+
+    unpadded = raw[PU_IMAGE_HEADER_SIZE:]
+    padded = unpadded + b"\xFF" if (len(unpadded) % 2 != 0) else unpadded
+    if PU_IMAGE_HEADER_SIZE + len(padded) > slot_size:
         raise UF2PackageError(
-            f"slot image at 0x{slot_addr:08X} ({len(raw)} bytes) exceeds partition size ({slot_size} bytes)"
+            f"slot image at 0x{slot_addr:08X} ({PU_IMAGE_HEADER_SIZE + len(padded)} bytes) "
+            f"exceeds partition size ({slot_size} bytes)"
         )
 
-    payload = raw[PU_IMAGE_HEADER_SIZE:]
-    if len(payload) % 2 != 0:
-        raise UF2PackageError("slot payload length must be 16-bit Thumb aligned (even byte count)")
+    _validate_cortex_m0_vectors(
+        unpadded,
+        vector_addr=slot_addr + PU_IMAGE_HEADER_SIZE,
+        code_limit_len=len(unpadded),
+        label="slot",
+    )
 
-    initial_msp, entry_point = struct.unpack_from("<2I", payload, 0)
-    if not (PU_RP2040_SRAM_BASE < initial_msp <= PU_RP2040_SRAM_TOP) or (initial_msp & 0x7) != 0:
-        raise UF2PackageError(
-            f"invalid initial MSP 0x{initial_msp:08X}; expected 8-byte aligned SRAM in "
-            f"(0x{PU_RP2040_SRAM_BASE:08X}, 0x{PU_RP2040_SRAM_TOP:08X}]"
-        )
-    if (entry_point & 1) == 0:
-        raise UF2PackageError(f"entry point 0x{entry_point:08X} lacks Cortex-M0+ Thumb bit 0")
-
-    entry_addr = entry_point & ~1
-    payload_base = slot_addr + PU_IMAGE_HEADER_SIZE
-    if not (payload_base + 8 <= entry_addr <= payload_base + len(payload) - 2):
-        raise UF2PackageError(
-            f"entry point 0x{entry_point:08X} is outside slot payload "
-            f"[0x{payload_base + 8:08X}, 0x{payload_base + len(payload):08X})"
-        )
-
-    entry_off = entry_addr - payload_base
-    if payload[entry_off : entry_off + 2] == b"\xFF\xFF":
-        raise UF2PackageError(f"entry point 0x{entry_point:08X} points to erased flash (0xFFFF)")
-
-    payload_crc = zlib.crc32(payload) & 0xFFFFFFFF
+    payload_crc = zlib.crc32(padded) & 0xFFFFFFFF
     desc_body = struct.pack(
         "<7I",
         PU_IMAGE_DESC_MAGIC,
         PU_IMAGE_DESC_VERSION,
         image_version & 0xFFFFFFFF,
         slot_addr,
-        len(payload),
+        len(padded),
         payload_crc,
         0,
     )
     header_crc = zlib.crc32(desc_body) & 0xFFFFFFFF
     header_page = (desc_body + struct.pack("<I", header_crc)).ljust(PU_IMAGE_HEADER_SIZE, b"\xFF")
-    return header_page + payload
+    return header_page + padded
 
 
 def _load_partition_pages(
@@ -172,6 +206,7 @@ def _load_partition_pages(
     part_info: dict,
     layout: dict,
     stamp_descriptor: bool,
+    validate_bootloader: bool = False,
     image_version: int,
 ) -> dict[int, bytes]:
     if not part_info.get("executable", False):
@@ -185,8 +220,13 @@ def _load_partition_pages(
 
     if isinstance(source, (str, Path)):
         path = Path(source)
+        suffix = path.suffix.lower()
+        if suffix not in (".bin", ".uf2"):
+            raise UF2PackageError(
+                f"{part_name}: unsupported file extension {path.suffix!r}; expected '.bin' or '.uf2'"
+            )
         data = path.read_bytes()
-        is_uf2 = path.suffix.lower() == ".uf2"
+        is_uf2 = suffix == ".uf2"
     elif isinstance(source, (bytes, bytearray)):
         data = bytes(source)
         is_uf2 = False
@@ -195,6 +235,10 @@ def _load_partition_pages(
 
     if not data:
         raise UF2PackageError(f"{part_name}: input image must not be empty")
+    if data.startswith(b"\x7fELF"):
+        raise UF2PackageError(
+            f"{part_name}: ELF inputs are not supported; provide a raw .bin or .uf2 image"
+        )
 
     if is_uf2:
         pages = uf2_to_pages(data, layout=layout)
@@ -204,11 +248,21 @@ def _load_partition_pages(
                     f"{part_name}: UF2 block at 0x{addr:08X} is outside partition "
                     f"[0x{part_base:08X}, 0x{part_end:08X})"
                 )
+        min_addr = min(pages)
+        max_addr = max(pages)
+        if min_addr != part_base:
+            raise UF2PackageError(
+                f"{part_name}: UF2 image must start at partition base 0x{part_base:08X}, "
+                f"got 0x{min_addr:08X}"
+            )
+        if validate_bootloader and part_name == "bootloader":
+            contiguous_len = (max_addr - part_base) + page_size
+            assembled = bytearray(b"\xFF" * contiguous_len)
+            for addr, pg in pages.items():
+                off = addr - part_base
+                assembled[off : off + page_size] = pg
+            _validate_bootloader_image(assembled, part_base=part_base, part_size=part_size)
         if stamp_descriptor and part_name in ("app_slot_a", "app_slot_b"):
-            min_addr = min(pages)
-            max_addr = max(pages)
-            if min_addr != part_base:
-                raise UF2PackageError(f"{part_name}: UF2 image must start at 0x{part_base:08X}")
             contiguous_len = (max_addr - part_base) + page_size
             assembled = bytearray(b"\xFF" * contiguous_len)
             for addr, pg in pages.items():
@@ -231,6 +285,9 @@ def _load_partition_pages(
             f"{part_name}: binary size ({len(data)} bytes) exceeds partition size ({part_size} bytes)"
         )
 
+    if validate_bootloader and part_name == "bootloader":
+        _validate_bootloader_image(data, part_base=part_base, part_size=part_size)
+
     if stamp_descriptor and part_name in ("app_slot_a", "app_slot_b"):
         data = stamp_slot_descriptor(
             data,
@@ -251,6 +308,7 @@ def pack_unified_uf2(
     slot_b: bytes | bytearray | str | Path | None = None,
     *,
     stamp_descriptor: bool = False,
+    validate_bootloader: bool | None = None,
     image_version: int = 1,
     layout_path: Path | None = None,
 ) -> bytes:
@@ -278,6 +336,10 @@ def pack_unified_uf2(
     if not active_inputs:
         raise UF2PackageError("at least one of bootloader, slot_a, or slot_b must be supplied")
 
+    should_validate_bootloader = (
+        stamp_descriptor if validate_bootloader is None else validate_bootloader
+    )
+
     flash_pages: dict[int, bytes] = {}
     for part_name, src in active_inputs:
         if part_name not in parts_by_name:
@@ -288,6 +350,7 @@ def pack_unified_uf2(
             part_info=parts_by_name[part_name],
             layout=layout,
             stamp_descriptor=stamp_descriptor,
+            validate_bootloader=should_validate_bootloader,
             image_version=image_version,
         )
         overlap = flash_pages.keys() & part_pages.keys()
@@ -461,8 +524,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output .uf2 file path")
     parser.add_argument(
         "--stamp-descriptor",
-        action="store_true",
-        help="Stamp valid pu_image_descriptor_t CRC32 header into slot binaries",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stamp valid pu_image_descriptor_t CRC32 header into slot binaries (default: enabled)",
     )
     parser.add_argument(
         "--image-version",

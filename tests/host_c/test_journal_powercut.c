@@ -485,6 +485,123 @@ static void test_ab_bootloader_rollback_after_three_attempts(void) {
     assert(both_bad.action == PU_BOOT_ACTION_ENTER_RECOVERY);
 }
 
+static void test_ab_three_strike_invalid_fallback_stays_in_recovery_across_power_cycles(void) {
+    reset_journal_banks();
+    reset_fake_flash();
+
+    /* Fallback Slot A is blank/invalid; trial Slot B has a valid descriptor/CRC image. */
+    install_valid_slot_image(SLOT_APP_B_ADDR, 1024u, 20u);
+
+    pu_journal_state_t staged = {
+        .active_slot = PU_SLOT_A,
+        .pending_slot = PU_SLOT_B,
+        .boot_attempts = 0u,
+        .flags = PU_JOURNAL_FLAG_TRIAL,
+    };
+    assert(pu_journal_commit(&staged));
+
+    /* 3 counted trial boots of Slot B that crash before confirming health. */
+    for (uint8_t attempt = 1u; attempt <= PU_JOURNAL_MAX_BOOT_ATTEMPTS; ++attempt) {
+        pu_boot_decision_t d = pu_bootloader_select_slot(false);
+        assert(d.action == PU_BOOT_ACTION_BOOT_SLOT);
+        assert(d.selected_slot == PU_SLOT_B);
+        assert(d.journal_updated);
+    }
+
+    uint64_t seq_after_strikes = 0u;
+    pu_journal_state_t state_after_strikes = {0};
+    assert(pu_journal_load_with_seq(&state_after_strikes, &seq_after_strikes));
+    assert(state_after_strikes.boot_attempts == PU_JOURNAL_MAX_BOOT_ATTEMPTS);
+
+    /*
+     * 4th and subsequent power cycles: fallback Slot A is invalid, so bootloader MUST
+     * stay in recovery with PU_JOURNAL_FLAG_TRIAL latched and NEVER promote/boot Slot B.
+     */
+    for (unsigned cycle = 0u; cycle < 6u; ++cycle) {
+        pu_boot_decision_t rec = pu_bootloader_select_slot(false);
+        assert(rec.action == PU_BOOT_ACTION_ENTER_RECOVERY);
+        assert(rec.selected_slot == PU_SLOT_NONE);
+
+        pu_journal_state_t latched = {0};
+        uint64_t cur_seq = 0u;
+        assert(pu_journal_load_with_seq(&latched, &cur_seq));
+        assert((latched.flags & PU_JOURNAL_FLAG_TRIAL) != 0u);
+        assert(latched.pending_slot == PU_SLOT_B);
+        assert(latched.boot_attempts == PU_JOURNAL_MAX_BOOT_ATTEMPTS);
+        assert(cur_seq == seq_after_strikes);
+    }
+
+    /* Also verify latching when trial was entered via pending_slot != active_slot without flag bit. */
+    reset_journal_banks();
+    pu_journal_state_t unflagged_exhausted = {
+        .active_slot = PU_SLOT_A,
+        .pending_slot = PU_SLOT_B,
+        .boot_attempts = PU_JOURNAL_MAX_BOOT_ATTEMPTS,
+        .flags = 0u,
+    };
+    assert(pu_journal_commit(&unflagged_exhausted));
+
+    for (unsigned cycle = 0u; cycle < 4u; ++cycle) {
+        pu_boot_decision_t rec = pu_bootloader_select_slot(false);
+        assert(rec.action == PU_BOOT_ACTION_ENTER_RECOVERY);
+        assert(rec.selected_slot == PU_SLOT_NONE);
+
+        pu_journal_state_t latched = {0};
+        assert(pu_journal_load(&latched));
+        assert((latched.flags & PU_JOURNAL_FLAG_TRIAL) != 0u);
+        assert(latched.pending_slot == PU_SLOT_B);
+        assert(latched.boot_attempts == PU_JOURNAL_MAX_BOOT_ATTEMPTS);
+    }
+}
+
+static void test_ab_trial_boot_commit_failure_refuses_uncounted_boot(void) {
+    /* Case A: Fallback Slot A invalid -> commit failure during trial boot enters recovery. */
+    reset_journal_banks();
+    reset_fake_flash();
+    install_valid_slot_image(SLOT_APP_B_ADDR, 1024u, 20u);
+
+    pu_journal_state_t staged = {
+        .active_slot = PU_SLOT_A,
+        .pending_slot = PU_SLOT_B,
+        .boot_attempts = 0u,
+        .flags = PU_JOURNAL_FLAG_TRIAL,
+    };
+    assert(pu_journal_commit(&staged));
+
+    for (unsigned attempt = 0u; attempt < 5u; ++attempt) {
+        pu_journal_inject_power_cut_after_bytes(0u);
+        pu_boot_decision_t d = pu_bootloader_select_slot(false);
+        pu_journal_inject_power_cut_after_bytes(SIZE_MAX);
+
+        assert(!d.journal_updated);
+        assert(d.action == PU_BOOT_ACTION_ENTER_RECOVERY);
+        assert(d.selected_slot == PU_SLOT_NONE);
+    }
+
+    /* Once flash commit succeeds again, attempt 1 is properly counted and allowed to boot. */
+    pu_boot_decision_t counted = pu_bootloader_select_slot(false);
+    assert(counted.journal_updated);
+    assert(counted.action == PU_BOOT_ACTION_BOOT_SLOT);
+    assert(counted.selected_slot == PU_SLOT_B);
+
+    /* Case B: Fallback Slot A valid -> commit failure during trial boot falls back to Slot A, never Slot B. */
+    reset_journal_banks();
+    reset_fake_flash();
+    install_valid_slot_image(SLOT_APP_A_ADDR, 1024u, 10u);
+    install_valid_slot_image(SLOT_APP_B_ADDR, 1024u, 20u);
+    assert(pu_journal_commit(&staged));
+
+    /* Allow only 64 bytes so the trial-increment page write tears/fails, then rollback runs. */
+    pu_journal_inject_power_cut_after_bytes(64u);
+    pu_boot_decision_t fb = pu_bootloader_select_slot(false);
+    pu_journal_inject_power_cut_after_bytes(SIZE_MAX);
+
+    assert(fb.selected_slot != PU_SLOT_B);
+    assert(fb.action == PU_BOOT_ACTION_BOOT_SLOT);
+    assert(fb.selected_slot == PU_SLOT_A);
+    assert(fb.image_info.version == 10u);
+}
+
 int main(void) {
     test_crc32_known_vectors();
     test_journal_blank_and_invalid_inputs();
@@ -492,6 +609,8 @@ int main(void) {
     test_journal_power_cut_every_erase_and_program_byte();
     test_image_validator_bounds_and_crc();
     test_ab_bootloader_rollback_after_three_attempts();
+    test_ab_three_strike_invalid_fallback_stays_in_recovery_across_power_cycles();
+    test_ab_trial_boot_commit_failure_refuses_uncounted_boot();
     puts("PASS: test_journal_powercut (CRC32, 4,353-offset power-cut journal, validator, A/B rollback)");
     return 0;
 }

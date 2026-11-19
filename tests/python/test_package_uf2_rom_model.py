@@ -16,6 +16,7 @@ from tools.package_uf2 import (  # noqa: E402
     UF2PackageError,
     pack_unified_uf2,
     simulate_rp2040_bootsel_flash,
+    stamp_slot_descriptor,
 )
 
 UF2_MAGIC_START0 = 0x0A324655
@@ -204,7 +205,7 @@ class TestPackageUF2RomModel(unittest.TestCase):
         sa_off = self.parts["app_slot_a"]["offset"]
         sb_off = self.parts["app_slot_b"]["offset"]
 
-        boot_bin = bytes([0xE7] * 4096)
+        boot_bin = _build_valid_slot_binary(self.flash_base, payload_len=3840)
         slot_a_bin = _build_valid_slot_binary(sa_addr, payload_len=1500)
         slot_b_bin = _build_valid_slot_binary(sb_addr, payload_len=2048)
 
@@ -278,6 +279,156 @@ class TestPackageUF2RomModel(unittest.TestCase):
             struct.pack_into("<I", bad_slot, 0x100, 0x20000000)  # Invalid MSP
             with self.assertRaises(UF2PackageError):
                 pack_unified_uf2(slot_a=bytes(bad_slot), stamp_descriptor=True)
+
+    def test_cli_defaults_to_stamping_and_validates_bootloader_vectors(self) -> None:
+        sa_addr = self.flash_base + self.parts["app_slot_a"]["offset"]
+        sa_off = self.parts["app_slot_a"]["offset"]
+
+        valid_boot = _build_valid_slot_binary(self.flash_base, payload_len=1024)
+        valid_slot_a = _build_valid_slot_binary(sa_addr, payload_len=1024)
+
+        scratch_base = ROOT / "build" / "py_scratch"
+        scratch_base.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch_base) as td:
+            td_path = Path(td)
+            p_boot = td_path / "bootloader.bin"
+            p_sa = td_path / "slot_a.bin"
+            p_out_default = td_path / "default_stamped.uf2"
+            p_out_raw = td_path / "no_stamp.uf2"
+
+            p_boot.write_bytes(valid_boot)
+            p_sa.write_bytes(valid_slot_a)
+
+            # Default CLI invocation (no --stamp-descriptor flag) MUST stamp slot descriptors
+            res_default = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "package_uf2.py"),
+                    "--bootloader",
+                    str(p_boot),
+                    "--slot-a",
+                    str(p_sa),
+                    "--output",
+                    str(p_out_default),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_default.returncode, 0, msg=res_default.stderr)
+            flashed_default = simulate_rp2040_bootsel_flash(p_out_default.read_bytes())
+            (magic,) = struct.unpack_from("<I", flashed_default, sa_off)
+            self.assertEqual(magic, PU_IMAGE_DESC_MAGIC)
+
+            # Explicit --no-stamp-descriptor preserves raw 0xFF header page
+            res_raw = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "package_uf2.py"),
+                    "--bootloader",
+                    str(p_boot),
+                    "--slot-a",
+                    str(p_sa),
+                    "--no-stamp-descriptor",
+                    "--output",
+                    str(p_out_raw),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res_raw.returncode, 0, msg=res_raw.stderr)
+            flashed_raw = simulate_rp2040_bootsel_flash(p_out_raw.read_bytes())
+            self.assertEqual(flashed_raw[sa_off : sa_off + 256], b"\xFF" * 256)
+
+            # Invalid bootloader vectors at 0x10000100 must be rejected when stamping is enabled
+            p_bad_boot = td_path / "bad_boot.bin"
+            p_bad_boot.write_bytes(bytes([0xE7] * 4096))
+            res_bad_boot = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "tools" / "package_uf2.py"),
+                    "--bootloader",
+                    str(p_bad_boot),
+                    "--slot-a",
+                    str(p_sa),
+                    "--output",
+                    str(td_path / "bad_out.uf2"),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_bad_boot.returncode, 0)
+
+    def test_odd_length_bin_payload_padded_with_ff_when_stamping(self) -> None:
+        sa_addr = self.flash_base + self.parts["app_slot_a"]["offset"]
+        sa_off = self.parts["app_slot_a"]["offset"]
+
+        odd_slot_a = _build_valid_slot_binary(sa_addr, payload_len=1501)
+        expected_padded_payload = odd_slot_a[0x100:] + b"\xFF"
+
+        uf2_bytes = pack_unified_uf2(slot_a=odd_slot_a, stamp_descriptor=True)
+        flashed = simulate_rp2040_bootsel_flash(uf2_bytes)
+
+        hdr = flashed[sa_off : sa_off + 32]
+        magic, hdr_ver, _, desc_addr, img_size, payload_crc, flags, hdr_crc = struct.unpack("<8I", hdr)
+        self.assertEqual(magic, PU_IMAGE_DESC_MAGIC)
+        self.assertEqual(hdr_ver, PU_IMAGE_DESC_VERSION)
+        self.assertEqual(desc_addr, sa_addr)
+        self.assertEqual(img_size, 1502)
+        self.assertEqual(flags, 0)
+        self.assertEqual(payload_crc, zlib.crc32(expected_padded_payload) & 0xFFFFFFFF)
+        self.assertEqual(hdr_crc, zlib.crc32(hdr[:28]) & 0xFFFFFFFF)
+        self.assertEqual(flashed[sa_off + 0x100 : sa_off + 0x100 + 1502], expected_padded_payload)
+
+        # Boundary: if +1 padding pushes total size beyond slot_size, must reject
+        with self.assertRaises(UF2PackageError):
+            stamp_slot_descriptor(odd_slot_a, slot_addr=sa_addr, slot_size=256 + 1501)
+
+    def test_rejects_elf_extension_and_elf_magic_inputs(self) -> None:
+        sa_addr = self.flash_base + self.parts["app_slot_a"]["offset"]
+        fake_elf = b"\x7fELF" + _build_valid_slot_binary(sa_addr, payload_len=512)[4:]
+
+        # Raw bytes starting with ELF magic must be rejected even with stamp_descriptor=False
+        with self.assertRaisesRegex(UF2PackageError, "ELF"):
+            pack_unified_uf2(slot_a=fake_elf, stamp_descriptor=False)
+
+        scratch_base = ROOT / "build" / "py_scratch"
+        scratch_base.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch_base) as td:
+            td_path = Path(td)
+
+            # Unsupported extension (.elf) must be rejected
+            p_elf = td_path / "firmware.elf"
+            p_elf.write_bytes(_build_valid_slot_binary(sa_addr, payload_len=512))
+            with self.assertRaisesRegex(UF2PackageError, r"\.bin.*\.uf2|extension"):
+                pack_unified_uf2(slot_a=p_elf, stamp_descriptor=False)
+
+            # ELF contents disguised with .bin extension must also be rejected
+            p_disguised = td_path / "disguised.bin"
+            p_disguised.write_bytes(fake_elf)
+            with self.assertRaisesRegex(UF2PackageError, "ELF"):
+                pack_unified_uf2(bootloader=p_disguised, stamp_descriptor=False)
+
+    def test_rejects_offset_uf2_not_starting_at_partition_base(self) -> None:
+        sa_addr = self.flash_base + self.parts["app_slot_a"]["offset"]
+
+        scratch_base = ROOT / "build" / "py_scratch"
+        scratch_base.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch_base) as td:
+            td_path = Path(td)
+
+            offset_boot_uf2 = td_path / "offset_boot.uf2"
+            offset_boot_uf2.write_bytes(
+                _encode_sparse_uf2({self.flash_base + 0x1000: b"\xAA" * 256})
+            )
+            with self.assertRaisesRegex(UF2PackageError, "start|base"):
+                pack_unified_uf2(bootloader=offset_boot_uf2, stamp_descriptor=False)
+
+            offset_sa_uf2 = td_path / "offset_sa.uf2"
+            offset_sa_uf2.write_bytes(
+                _encode_sparse_uf2({sa_addr + 0x1000: b"\xBB" * 256})
+            )
+            with self.assertRaisesRegex(UF2PackageError, "start|base"):
+                pack_unified_uf2(slot_a=offset_sa_uf2, stamp_descriptor=False)
 
 
 if __name__ == "__main__":

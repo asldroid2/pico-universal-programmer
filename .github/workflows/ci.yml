@@ -57,8 +57,8 @@ jobs:
             bash tests/host_c/run_tests.sh
           elif [ -f tests/host_c/CMakeLists.txt ]; then
             cmake -S tests/host_c -B build/host_c_cmake \
-              -DCMAKE_C_FLAGS="-Wall -Wextra -Werror -Wundef -fsanitize=address,undefined -fno-omit-frame-pointer" \
-              -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror -Wundef -fsanitize=address,undefined -fno-omit-frame-pointer"
+              -DCMAKE_C_FLAGS="-DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -fsanitize=address,undefined -fno-omit-frame-pointer" \
+              -DCMAKE_CXX_FLAGS="-DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -fsanitize=address,undefined -fno-omit-frame-pointer"
             cmake --build build/host_c_cmake -j
             ctest --test-dir build/host_c_cmake --output-on-failure
           elif compgen -G "tests/host_c/test_*.c" > /dev/null || compgen -G "tests/host_c/test_*.cpp" > /dev/null; then
@@ -68,14 +68,14 @@ jobs:
               [ -f "$src" ] || continue
               case "$(basename "$src")" in main.c) continue ;; esac
               obj="build/host_c/objs/$(echo "$src" | tr '/' '_').o"
-              cc -std=c11 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$src" -o "$obj"
+              cc -std=c11 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$src" -o "$obj"
               obj_files+=("$obj")
             done
             for src in bootloader/*.cpp firmware/*.cpp; do
               [ -f "$src" ] || continue
               case "$(basename "$src")" in main.cpp) continue ;; esac
               obj="build/host_c/objs/$(echo "$src" | tr '/' '_').o"
-              c++ -std=c++17 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$src" -o "$obj"
+              c++ -std=c++17 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$src" -o "$obj"
               obj_files+=("$obj")
             done
             lib_args=()
@@ -87,7 +87,7 @@ jobs:
               [ -f "$tsrc" ] || continue
               tobj="build/host_c/objs/$(basename "${tsrc%.c}").c.o"
               bin="build/host_c/bins/$(basename "${tsrc%.c}")"
-              cc -std=c11 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
+              cc -std=c11 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
               c++ -Wall -Wextra -Werror -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer "$tobj" "${lib_args[@]}" -o "$bin"
               "$bin"
             done
@@ -95,7 +95,7 @@ jobs:
               [ -f "$tsrc" ] || continue
               tobj="build/host_c/objs/$(basename "${tsrc%.cpp}").cpp.o"
               bin="build/host_c/bins/$(basename "${tsrc%.cpp}")"
-              c++ -std=c++17 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
+              c++ -std=c++17 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
               c++ -std=c++17 -Wall -Wextra -Werror -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer "$tobj" "${lib_args[@]}" -o "$bin"
               "$bin"
             done
@@ -186,8 +186,8 @@ jobs:
             cmake "${cmake_gen[@]}" -S tests/host_c -B build/host_c_cmake \
               -DCMAKE_C_COMPILER="$CC_BIN" \
               -DCMAKE_CXX_COMPILER="$CXX_BIN" \
-              -DCMAKE_C_FLAGS="-Wall -Wextra -Werror -Wundef" \
-              -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror -Wundef"
+              -DCMAKE_C_FLAGS="-DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef" \
+              -DCMAKE_CXX_FLAGS="-DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef"
             cmake --build build/host_c_cmake -j
             ctest --test-dir build/host_c_cmake --output-on-failure
           elif compgen -G "tests/host_c/test_*.c" > /dev/null || compgen -G "tests/host_c/test_*.cpp" > /dev/null; then
@@ -197,14 +197,14 @@ jobs:
               [ -f "$src" ] || continue
               case "$(basename "$src")" in main.c) continue ;; esac
               obj="build/host_c/objs/$(echo "$src" | tr '/' '_').o"
-              "$CC_BIN" -std=c11 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$src" -o "$obj"
+              "$CC_BIN" -std=c11 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$src" -o "$obj"
               obj_files+=("$obj")
             done
             for src in bootloader/*.cpp firmware/*.cpp; do
               [ -f "$src" ] || continue
               case "$(basename "$src")" in main.cpp) continue ;; esac
               obj="build/host_c/objs/$(echo "$src" | tr '/' '_').o"
-              "$CXX_BIN" -std=c++17 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$src" -o "$obj"
+              "$CXX_BIN" -std=c++17 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$src" -o "$obj"
               obj_files+=("$obj")
             done
             lib_args=()
@@ -216,7 +216,7 @@ jobs:
               [ -f "$tsrc" ] || continue
               tobj="build/host_c/objs/$(basename "${tsrc%.c}").c.o"
               bin="build/host_c/bins/$(basename "${tsrc%.c}").exe"
-              "$CC_BIN" -std=c11 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
+              "$CC_BIN" -std=c11 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
               "$CXX_BIN" -Wall -Wextra -Werror -g -O1 "$tobj" "${lib_args[@]}" -o "$bin"
               "$bin"
             done
@@ -224,7 +224,7 @@ jobs:
               [ -f "$tsrc" ] || continue
               tobj="build/host_c/objs/$(basename "${tsrc%.cpp}").cpp.o"
               bin="build/host_c/bins/$(basename "${tsrc%.cpp}").exe"
-              "$CXX_BIN" -std=c++17 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
+              "$CXX_BIN" -std=c++17 -DPU_HOST_TEST=1 -Wall -Wextra -Werror -Wundef -g -O1 -I. -Iconfig -Iinclude -c "$tsrc" -o "$tobj"
               "$CXX_BIN" -std=c++17 -Wall -Wextra -Werror -g -O1 "$tobj" "${lib_args[@]}" -o "$bin"
               "$bin"
             done

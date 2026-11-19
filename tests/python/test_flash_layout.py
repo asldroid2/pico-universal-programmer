@@ -716,6 +716,26 @@ class FoundationBaselineTests(unittest.TestCase):
         self.assertIn("config/board_pinout.h", windows_part)
         self.assertIn("tests/host_c", windows_part)
 
+        # Every host C/C++ compilation command (CMake C/CXX flags + 4 fallback compile commands)
+        # in both verify-linux and verify-windows must pass -DPU_HOST_TEST=1.
+        for job_name, job_part in (("verify-linux", linux_part), ("verify-windows", windows_part)):
+            host_step = job_part.split("tests/host_c/run_tests.sh", 1)[1]
+            self.assertGreaterEqual(
+                host_step.count("-DPU_HOST_TEST=1"),
+                6,
+                f"{job_name} host C/C++ step must pass -DPU_HOST_TEST=1 in CMake and all fallback compile commands",
+            )
+            for line in host_step.splitlines():
+                stripped = line.strip()
+                if stripped.startswith(("-DCMAKE_C_FLAGS=", "-DCMAKE_CXX_FLAGS=")) or (
+                    " -c " in stripped and ("$src" in stripped or "$tsrc" in stripped)
+                ):
+                    self.assertIn(
+                        "-DPU_HOST_TEST=1",
+                        stripped,
+                        f"{job_name} compile line missing -DPU_HOST_TEST=1: {stripped!r}",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
