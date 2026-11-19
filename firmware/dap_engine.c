@@ -91,6 +91,28 @@ uint32_t pu_dap_compute_pio_clkdiv_q16_8(uint32_t sys_hz,
 /* Platform Wire HAL: RP2040 PIO0 Hardware Backend vs Host Simulation         */
 /* -------------------------------------------------------------------------- */
 
+#define PU_DAP_DRIVABLE_PINS_MASK \
+    ((uint8_t)(PU_DAP_PIN_SWCLK_TCK | PU_DAP_PIN_SWDIO_TMS | PU_DAP_PIN_TDI | PU_DAP_PIN_nRESET))
+
+static uint8_t dap_wait_for_drivable_pins(uint8_t pin_output,
+                                          uint8_t pin_select,
+                                          uint32_t wait_us,
+                                          uint8_t (*sample_fn)(void),
+                                          uint64_t (*now_us_fn)(void)) {
+    const uint8_t drivable_mask = (uint8_t)(pin_select & PU_DAP_DRIVABLE_PINS_MASK);
+    uint8_t sampled = sample_fn();
+    if (wait_us != 0u) {
+        uint64_t start = now_us_fn();
+        while (((sampled ^ pin_output) & drivable_mask) != 0u) {
+            if ((now_us_fn() - start) >= (uint64_t)wait_us) {
+                break;
+            }
+            sampled = sample_fn();
+        }
+    }
+    return sampled;
+}
+
 #if !defined(PU_HOST_TEST)
 
 #if defined(__GNUC__)
@@ -545,6 +567,10 @@ static uint8_t rp2040_sample_pins(void) {
     return pins;
 }
 
+static uint64_t rp2040_now_us_64(void) {
+    return time_us_64();
+}
+
 static uint8_t rp2040_swj_pins_io(uint8_t pin_output, uint8_t pin_select, uint32_t wait_us) {
     if ((pin_select & PU_DAP_PIN_SWCLK_TCK) != 0u) {
         gpio_set_outover(PU_PIN_SWCLK_TCK,
@@ -575,17 +601,8 @@ static uint8_t rp2040_swj_pins_io(uint8_t pin_output, uint8_t pin_select, uint32
         }
     }
 
-    uint8_t sampled = rp2040_sample_pins();
-    if (wait_us != 0u) {
-        uint64_t start = time_us_64();
-        while (((sampled ^ pin_output) & pin_select) != 0u) {
-            if ((time_us_64() - start) >= (uint64_t)wait_us) {
-                break;
-            }
-            sampled = rp2040_sample_pins();
-        }
-    }
-    return sampled;
+    return dap_wait_for_drivable_pins(pin_output, pin_select, wait_us,
+                                      rp2040_sample_pins, rp2040_now_us_64);
 }
 
 static void rp2040_sio_override_end(void) {
@@ -604,7 +621,10 @@ static uint32_t rp2040_get_timestamp_us(void) {
 
 static uint32_t s_sim_dp_regs[4];
 static uint32_t s_sim_ap_regs[4];
-static uint8_t s_sim_pins = (uint8_t)(PU_DAP_PIN_SWDIO_TMS | PU_DAP_PIN_TDO | PU_DAP_PIN_nTRST | PU_DAP_PIN_nRESET);
+static uint8_t s_sim_pio_pins = PU_DAP_PIN_SWDIO_TMS;
+static uint8_t s_sim_override_mask = 0u;
+static uint8_t s_sim_override_out = 0u;
+static bool s_sim_nreset_low = false;
 static uint32_t s_sim_time_us = 0u;
 
 static void host_fake_drain_pio(void) {}
@@ -617,6 +637,26 @@ static const pu_pin_hal_t kHostFakePinHal = {
     .set_swio_pullup = host_fake_set_swio_pu,
     .set_vtarg_power = NULL
 };
+
+static void host_sim_port_setup(uint8_t port) {
+    s_sim_override_mask = 0u;
+    s_sim_override_out = 0u;
+    s_sim_nreset_low = false;
+    s_sim_pio_pins = (port == DAP_PORT_JTAG)
+                         ? (uint8_t)(PU_DAP_PIN_SWDIO_TMS | PU_DAP_PIN_TDI)
+                         : (uint8_t)PU_DAP_PIN_SWDIO_TMS;
+}
+
+static void host_sim_port_off(void) {
+    s_sim_override_mask = 0u;
+    s_sim_override_out = 0u;
+    s_sim_nreset_low = false;
+    s_sim_pio_pins = PU_DAP_PIN_SWDIO_TMS;
+}
+
+static void host_sim_sio_override_end(void) {
+    s_sim_override_mask = 0u;
+}
 
 static uint8_t host_sim_swd_transfer(uint8_t req_hdr,
                                      uint32_t *data,
@@ -656,10 +696,31 @@ static void host_sim_jtag_sequence(uint32_t bit_count,
     }
 }
 
+static uint8_t host_sim_sample_pins(void) {
+    uint8_t pio_or_sio = (uint8_t)((s_sim_pio_pins & ~s_sim_override_mask) |
+                                   (s_sim_override_out & s_sim_override_mask));
+    uint8_t pins = (uint8_t)(pio_or_sio | PU_DAP_PIN_TDO | PU_DAP_PIN_nTRST);
+    if (!s_sim_nreset_low) {
+        pins |= PU_DAP_PIN_nRESET;
+    }
+    return pins;
+}
+
+static uint64_t host_sim_now_us_64(void) {
+    s_sim_time_us += 10u;
+    return (uint64_t)s_sim_time_us;
+}
+
 static uint8_t host_sim_swj_pins_io(uint8_t pin_output, uint8_t pin_select, uint32_t wait_us) {
-    s_sim_pins = (uint8_t)((s_sim_pins & ~pin_select) | (pin_output & pin_select));
-    s_sim_time_us += wait_us;
-    return s_sim_pins;
+    const uint8_t sio_pins = (uint8_t)(PU_DAP_PIN_SWCLK_TCK | PU_DAP_PIN_SWDIO_TMS | PU_DAP_PIN_TDI);
+    uint8_t sel_sio = (uint8_t)(pin_select & sio_pins);
+    s_sim_override_mask |= sel_sio;
+    s_sim_override_out = (uint8_t)((s_sim_override_out & ~sel_sio) | (pin_output & sel_sio));
+    if ((pin_select & PU_DAP_PIN_nRESET) != 0u) {
+        s_sim_nreset_low = ((pin_output & PU_DAP_PIN_nRESET) == 0u);
+    }
+    return dap_wait_for_drivable_pins(pin_output, pin_select, wait_us,
+                                      host_sim_sample_pins, host_sim_now_us_64);
 }
 
 static void host_sim_delay_us(uint32_t delay_us) {
@@ -673,8 +734,8 @@ static uint32_t host_sim_timestamp_us(void) {
 
 static const pu_dap_wire_hal_t kHostSimWireHal = {
     .sys_clock_hz = 125000000u,
-    .port_setup = NULL,
-    .port_off = NULL,
+    .port_setup = host_sim_port_setup,
+    .port_off = host_sim_port_off,
     .set_clock = NULL,
     .swj_sequence = NULL,
     .swd_sequence = NULL,
@@ -683,7 +744,7 @@ static const pu_dap_wire_hal_t kHostSimWireHal = {
     .pio_drain = NULL,
     .sio_override_begin = NULL,
     .swj_pins_io = host_sim_swj_pins_io,
-    .sio_override_end = NULL,
+    .sio_override_end = host_sim_sio_override_end,
     .delay_us = host_sim_delay_us,
     .get_timestamp_us = host_sim_timestamp_us
 };
@@ -706,6 +767,7 @@ static uint32_t s_match_mask = 0u;
 
 static uint8_t s_swd_turnaround = 1u;
 static bool s_swd_data_phase = false;
+static bool s_sio_override_active = false;
 static volatile bool s_transfer_abort = false;
 
 static uint8_t s_jtag_dev_count = 1u;
@@ -723,6 +785,7 @@ static void reset_dap_protocol_state(void) {
     s_match_mask = 0u;
     s_swd_turnaround = 1u;
     s_swd_data_phase = false;
+    s_sio_override_active = false;
     s_transfer_abort = false;
     s_jtag_dev_count = 1u;
     memset(s_jtag_ir_len, 0, sizeof(s_jtag_ir_len));
@@ -768,7 +831,10 @@ void pu_dap_init_for_test(void) {
     memset(s_sim_dp_regs, 0, sizeof(s_sim_dp_regs));
     memset(s_sim_ap_regs, 0, sizeof(s_sim_ap_regs));
     s_sim_dp_regs[0] = 0x2BA01477u; /* Simulated Cortex-M SW-DP IDCODE */
-    s_sim_pins = (uint8_t)(PU_DAP_PIN_SWDIO_TMS | PU_DAP_PIN_TDO | PU_DAP_PIN_nTRST | PU_DAP_PIN_nRESET);
+    s_sim_pio_pins = PU_DAP_PIN_SWDIO_TMS;
+    s_sim_override_mask = 0u;
+    s_sim_override_out = 0u;
+    s_sim_nreset_low = false;
     s_sim_time_us = 0u;
     pu_engine_init(&kHostFakePinHal);
     pu_dap_init(&kHostSimWireHal);
@@ -796,6 +862,15 @@ static void sync_wire_clock_if_needed(void) {
     }
 }
 
+static void release_sio_overrides_if_active(void) {
+    if (s_sio_override_active) {
+        s_sio_override_active = false;
+        if (s_wire.sio_override_end != NULL) {
+            s_wire.sio_override_end();
+        }
+    }
+}
+
 static bool ensure_active_dap_session(uint64_t now_us) {
     if (s_active_port == DAP_PORT_DISABLED) {
         return false;
@@ -805,6 +880,7 @@ static bool ensure_active_dap_session(uint64_t now_us) {
         /* Session lost due to timeout, USB reset, or hardware fault latch */
         s_active_port = DAP_PORT_DISABLED;
         s_cached_clkdiv_q16_8 = 0u;
+        s_sio_override_active = false;
         return false;
     }
     sync_wire_clock_if_needed();
@@ -816,6 +892,7 @@ void pu_dap_on_usb_disconnect(void) {
     if (s_active_port != DAP_PORT_DISABLED) {
         pu_engine_state_t expected = port_to_engine_state(s_active_port);
         if (pu_engine_current() == expected) {
+            release_sio_overrides_if_active();
             if (s_wire.port_off != NULL) {
                 s_wire.port_off();
             }
@@ -823,6 +900,7 @@ void pu_dap_on_usb_disconnect(void) {
         }
         s_active_port = DAP_PORT_DISABLED;
         s_cached_clkdiv_q16_8 = 0u;
+        s_sio_override_active = false;
     }
 }
 
@@ -1153,6 +1231,7 @@ static uint8_t execute_bus_transfer(uint8_t dap_index, uint8_t req_hdr, uint32_t
         if (s_wire.swd_transfer == NULL) {
             return DAP_TRANSFER_ERROR;
         }
+        release_sio_overrides_if_active();
         uint8_t ack = s_wire.swd_transfer(req_hdr, data, s_swd_turnaround, s_swd_data_phase);
         if (s_idle_cycles != 0u && s_wire.swd_sequence != NULL) {
             uint8_t zeros[32] = {0};
@@ -1165,6 +1244,7 @@ static uint8_t execute_bus_transfer(uint8_t dap_index, uint8_t req_hdr, uint32_t
         if (dap_index >= s_jtag_dev_count || s_wire.jtag_sequence == NULL) {
             return DAP_TRANSFER_ERROR;
         }
+        release_sio_overrides_if_active();
         uint32_t ir = ((req_hdr & DAP_TRANSFER_APnDP) != 0u) ? PU_JTAG_IR_APACC : PU_JTAG_IR_DPACC;
         jtag_write_ir(dap_index, ir);
 
@@ -1313,6 +1393,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             if (prev_engine == target_engine &&
                 pu_engine_renew_deadline(target_engine, now_us, PU_DAP_SESSION_TIMEOUT_US) == PU_OK) {
                 s_cached_clkdiv_q16_8 = 0u;
+                release_sio_overrides_if_active();
                 if (s_wire.port_setup != NULL) {
                     s_wire.port_setup(desired_port);
                 }
@@ -1321,12 +1402,14 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
                 return 2u;
             }
             if (pu_engine_current() == prev_engine) {
+                release_sio_overrides_if_active();
                 if (s_wire.port_off != NULL) {
                     s_wire.port_off();
                 }
                 (void)pu_engine_release(prev_engine);
             }
             s_active_port = DAP_PORT_DISABLED;
+            s_sio_override_active = false;
         }
 
         if (pu_engine_acquire(target_engine, now_us, PU_DAP_SESSION_TIMEOUT_US) != PU_OK) {
@@ -1337,6 +1420,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
         s_active_port = desired_port;
         s_transfer_abort = false;
         s_cached_clkdiv_q16_8 = 0u; /* Mandatory clock-cache invalidation on SWD/JTAG entry */
+        release_sio_overrides_if_active();
         if (s_wire.port_setup != NULL) {
             s_wire.port_setup(desired_port);
         }
@@ -1349,6 +1433,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
         if (s_active_port != DAP_PORT_DISABLED) {
             pu_engine_state_t expected = port_to_engine_state(s_active_port);
             if (pu_engine_current() == expected) {
+                release_sio_overrides_if_active();
                 if (s_wire.port_off != NULL) {
                     s_wire.port_off();
                 }
@@ -1356,6 +1441,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             }
             s_active_port = DAP_PORT_DISABLED;
             s_cached_clkdiv_q16_8 = 0u;
+            s_sio_override_active = false;
         }
         resp[1] = DAP_OK;
         return 2u;
@@ -1428,7 +1514,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
                         }
                     }
                     do {
-                        uint8_t poll_tr = ((tr & DAP_TRANSFER_APnDP) != 0u)
+                        uint8_t poll_tr = (((tr & DAP_TRANSFER_APnDP) != 0u) && (m_retry == 0u))
                                               ? (uint8_t)(DAP_TRANSFER_RnW | DAP_TRANSFER_A2 | DAP_TRANSFER_A3)
                                               : tr;
                         ack = execute_bus_transfer_with_retry(dap_index, poll_tr, &data);
@@ -1638,6 +1724,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             uint8_t ack = execute_bus_transfer(dap_index, 0x00u /* DP ABORT Write */, &abort_val);
             resp[1] = (ack == DAP_TRANSFER_OK) ? DAP_OK : DAP_ERROR;
         } else if (s_active_port == DAP_PORT_JTAG && dap_index < s_jtag_dev_count && s_wire.jtag_sequence != NULL) {
+            release_sio_overrides_if_active();
             jtag_write_ir(dap_index, PU_JTAG_IR_ABORT);
             jtag_clock_tms(0x01u, 3u);
             if (dap_index > 0u) {
@@ -1694,19 +1781,24 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             wait_us = PU_DAP_MAX_PIN_WAIT_US;
         }
 
-        /* Enforced handoff: PIO drain -> SIO override -> pin R/W + bounded wait -> release overrides */
-        if (s_wire.pio_drain != NULL) {
-            s_wire.pio_drain();
-        }
-        if (s_wire.sio_override_begin != NULL) {
-            s_wire.sio_override_begin();
+        /* Enforced PIO->SIO handoff; GPIO overrides remain latched across DAP_Delay &
+         * subsequent SWJ_Pins calls until the next PIO wire transfer, port_setup, or port_off. */
+        const uint8_t sio_pins =
+            (uint8_t)(PU_DAP_PIN_SWCLK_TCK | PU_DAP_PIN_SWDIO_TMS | PU_DAP_PIN_TDI);
+        if (!s_sio_override_active) {
+            if (s_wire.pio_drain != NULL) {
+                s_wire.pio_drain();
+            }
+            if ((pin_select & sio_pins) != 0u) {
+                if (s_wire.sio_override_begin != NULL) {
+                    s_wire.sio_override_begin();
+                }
+                s_sio_override_active = true;
+            }
         }
         uint8_t pin_in = 0u;
         if (s_wire.swj_pins_io != NULL) {
             pin_in = s_wire.swj_pins_io(pin_output, pin_select, wait_us);
-        }
-        if (s_wire.sio_override_end != NULL) {
-            s_wire.sio_override_end();
         }
         resp[1] = pin_in;
         return 2u;
@@ -1734,6 +1826,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             return 2u;
         }
         uint32_t bit_count = (req[1] != 0u) ? (uint32_t)req[1] : 256u;
+        release_sio_overrides_if_active();
         if (s_wire.swj_sequence != NULL) {
             s_wire.swj_sequence(bit_count, &req[2]);
         }
@@ -1758,6 +1851,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             resp[1] = DAP_ERROR;
             return 2u;
         }
+        release_sio_overrides_if_active();
         uint8_t seq_count = req[1];
         size_t in_off = 2u;
         size_t out_off = 2u;
@@ -1789,6 +1883,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             resp[1] = DAP_ERROR;
             return 2u;
         }
+        release_sio_overrides_if_active();
         uint8_t seq_count = req[1];
         size_t in_off = 2u;
         size_t out_off = 2u;
@@ -1837,6 +1932,7 @@ static size_t execute_single_command(const uint8_t *req, uint8_t *resp, uint64_t
             resp[1] = DAP_ERROR;
             return 2u;
         }
+        release_sio_overrides_if_active();
         uint8_t tdo[4] = {0x77u, 0x14u, 0xA0u, 0x4Bu};
         if (s_wire.jtag_sequence != NULL) {
             jtag_write_ir(index, PU_JTAG_IR_IDCODE);
