@@ -1,17 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
 
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/gdbpipe"
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/usbprobe"
 )
 
@@ -45,36 +49,45 @@ func (osCommandRunner) Run(spec commandSpec, stdout, stderr io.Writer) error {
 }
 
 type cliEnv struct {
-	stdout         io.Writer
-	stderr         io.Writer
-	getenv         func(string) string
-	geteuid        func() int
-	goos           string
-	cmdRunner      commandRunner
-	discoverProbes func(vid, pid uint16) ([]usbprobe.ProbeDevice, error)
+	ctx             context.Context
+	stdin           io.Reader
+	stdout          io.Writer
+	stderr          io.Writer
+	getenv          func(string) string
+	geteuid         func() int
+	goos            string
+	cmdRunner       commandRunner
+	discoverProbes  func(vid, pid uint16) ([]usbprobe.ProbeDevice, error)
+	portOpener      gdbpipe.PortOpener
+	ctrlTransceiver func(probe usbprobe.ProbeDevice, req []byte) ([]byte, error)
+	onGDBListen     func(net.Addr)
 }
 
 type cliContext struct {
-	stdout         io.Writer
-	stderr         io.Writer
-	getenv         func(string) string
-	geteuid        func() int
-	goos           string
-	cmdRunner      commandRunner
-	discoverProbes func(vid, pid uint16) ([]usbprobe.ProbeDevice, error)
-	globalPID      string
+	runCtx          context.Context
+	stdin           io.Reader
+	stdout          io.Writer
+	stderr          io.Writer
+	getenv          func(string) string
+	geteuid         func() int
+	goos            string
+	cmdRunner       commandRunner
+	discoverProbes  func(vid, pid uint16) ([]usbprobe.ProbeDevice, error)
+	portOpener      gdbpipe.PortOpener
+	ctrlTransceiver func(probe usbprobe.ProbeDevice, req []byte) ([]byte, error)
+	onGDBListen     func(net.Addr)
+	globalPID       string
 }
 
 type subcommandFunc func(ctx cliContext, args []string) int
 
-// dispatchHooks provides clean extension points for Task 8 (check, upload, gdb-pipe,
-// recover, export-vscode) and Tasks 11/12 (factory-qc, bench).
+// dispatchHooks routes live Task 8 commands and preserves clean extension points for Tasks 11/12.
 var dispatchHooks = map[string]subcommandFunc{
-	"check":         stubSubcommand("check", "Task 8"),
-	"upload":        stubSubcommand("upload", "Task 8"),
-	"gdb-pipe":      stubSubcommand("gdb-pipe", "Task 8"),
-	"recover":       stubSubcommand("recover", "Task 8"),
-	"export-vscode": stubSubcommand("export-vscode", "Task 8"),
+	"check":         runCheck,
+	"upload":        runUpload,
+	"gdb-pipe":      runGDBPipe,
+	"recover":       runRecover,
+	"export-vscode": runExportVSCode,
 	"factory-qc":    stubSubcommand("factory-qc", "Task 11"),
 	"bench":         stubSubcommand("bench", "Task 12"),
 }
@@ -87,7 +100,16 @@ func stubSubcommand(name, phase string) subcommandFunc {
 }
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, os.Getenv))
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	code := runWithEnv(os.Args[1:], cliEnv{
+		ctx:    sigCtx,
+		stdin:  os.Stdin,
+		stdout: os.Stdout,
+		stderr: os.Stderr,
+		getenv: os.Getenv,
+	})
+	stop()
+	os.Exit(code)
 }
 
 func run(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
@@ -99,6 +121,10 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 }
 
 func runWithEnv(args []string, env cliEnv) int {
+	runCtx := env.ctx
+	if runCtx == nil {
+		runCtx = context.Background()
+	}
 	stdout := env.stdout
 	if stdout == nil {
 		stdout = io.Discard
@@ -157,14 +183,19 @@ func runWithEnv(args []string, env cliEnv) int {
 	}
 
 	ctx := cliContext{
-		stdout:         stdout,
-		stderr:         stderr,
-		getenv:         getenv,
-		geteuid:        geteuid,
-		goos:           goos,
-		cmdRunner:      cmdRunner,
-		discoverProbes: discoverProbes,
-		globalPID:      *pidFlag,
+		runCtx:          runCtx,
+		stdin:           env.stdin,
+		stdout:          stdout,
+		stderr:          stderr,
+		getenv:          getenv,
+		geteuid:         geteuid,
+		goos:            goos,
+		cmdRunner:       cmdRunner,
+		discoverProbes:  discoverProbes,
+		portOpener:      env.portOpener,
+		ctrlTransceiver: env.ctrlTransceiver,
+		onGDBListen:     env.onGDBListen,
+		globalPID:       *pidFlag,
 	}
 
 	sub := rest[0]
@@ -272,10 +303,21 @@ func runList(ctx cliContext, args []string) int {
 		return 2
 	}
 
-	probes, err := usbprobe.DiscoverProbesWithID(*serialFlag, vid, pid)
+	allProbes, err := ctx.discoverProbes(vid, pid)
 	if err != nil {
 		fmt.Fprintf(ctx.stderr, "pu list: discovery failed: %v\n", err)
 		return 1
+	}
+	var probes []usbprobe.ProbeDevice
+	wantSerial := strings.TrimSpace(*serialFlag)
+	if wantSerial == "" {
+		probes = allProbes
+	} else {
+		for _, p := range allProbes {
+			if strings.EqualFold(p.Serial, wantSerial) {
+				probes = append(probes, p)
+			}
+		}
 	}
 
 	if *jsonFlag {
