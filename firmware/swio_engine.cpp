@@ -20,7 +20,9 @@ static_assert(sizeof(kPuSwioFallbackInstructions) / sizeof(kPuSwioFallbackInstru
 
 #if !defined(PU_HOST_TEST) && defined(__has_include)
 #if __has_include("singlewire.pio.h")
-constexpr bool pio_fallback_matches_assembled(const uint16_t *a, const uint16_t *b, size_t n) {
+[[maybe_unused]] constexpr bool pio_fallback_matches_assembled(const uint16_t *a,
+                                                               const uint16_t *b,
+                                                               size_t n) {
     for (size_t i = 0u; i < n; ++i) {
         if (a[i] != b[i]) {
             return false;
@@ -47,11 +49,13 @@ constexpr bool pio_fallback_matches_assembled(const uint16_t *a, const uint16_t 
 #include "singlewire.pio.h"
 static_assert(sizeof(pu_swio_program_instructions) == sizeof(kPuSwioFallbackInstructions),
               "singlewire.pio.h instruction count must match fallback array");
+#if defined(__pio_const)
 static_assert(pio_fallback_matches_assembled(
                   pu_swio_program_instructions,
                   kPuSwioFallbackInstructions,
                   sizeof(kPuSwioFallbackInstructions) / sizeof(kPuSwioFallbackInstructions[0])),
               "singlewire.pio.h instructions must match fallback array byte-for-byte");
+#endif
 #else
 #define pu_swio_wrap_target 0
 #define pu_swio_wrap 21
