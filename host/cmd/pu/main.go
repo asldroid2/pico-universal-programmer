@@ -89,7 +89,7 @@ var dispatchHooks = map[string]subcommandFunc{
 	"recover":       runRecover,
 	"export-vscode": runExportVSCode,
 	"factory-qc":    runFactoryQC,
-	"bench":         stubSubcommand("bench", "Task 12"),
+	"bench":         runBench,
 }
 
 func stubSubcommand(name, phase string) subcommandFunc {
