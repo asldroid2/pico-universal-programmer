@@ -95,6 +95,9 @@ size_t pu_ch32_gdb_feed(const uint8_t *in,
                         uint8_t *out,
                         size_t out_cap,
                         uint64_t now_us);
+size_t pu_ch32_gdb_poll(uint8_t *out,
+                        size_t out_cap,
+                        uint64_t now_us);
 pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us);
 void pu_ch32_on_disconnect(void);
 
@@ -115,6 +118,7 @@ pu_status_t pu_ch32_gdb_send_checked(const char *packet_without_csum,
                                      uint64_t now_us);
 bool pu_swio_fake_flash_matches_original(void);
 void pu_swio_inject_fake_flash_write_fail(int fail_on_write_index);
+const uint16_t *pu_swio_get_pio_instructions(size_t *out_count);
 #endif
 
 #ifdef __cplusplus

@@ -8,6 +8,30 @@
 #include <cstdio>
 #include <cstring>
 
+namespace {
+/* Assembled via pioasm from firmware/pio/singlewire.pio (22 instructions) */
+constexpr uint16_t kPuSwioFallbackInstructions[] = {
+    0x80a0, 0x6037, 0x7041, 0x1166, 0x05e2, 0x0008, 0xbb42, 0x03e2,
+    0x004a, 0x0014, 0x002e, 0xe020, 0x80a0, 0x0002, 0xe03f, 0xb242,
+    0xa342, 0x4b01, 0x004f, 0x8020, 0xe042, 0x0f95,
+};
+static_assert(sizeof(kPuSwioFallbackInstructions) / sizeof(kPuSwioFallbackInstructions[0]) <= 24u,
+              "singlewire.pio must occupy <= 24 PIO1 instruction words");
+
+#if !defined(PU_HOST_TEST) && defined(__has_include)
+#if __has_include("singlewire.pio.h")
+constexpr bool pio_fallback_matches_assembled(const uint16_t *a, const uint16_t *b, size_t n) {
+    for (size_t i = 0u; i < n; ++i) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
+#endif
+} // namespace
+
 #if !defined(PU_HOST_TEST)
 
 #if defined(__GNUC__)
@@ -17,19 +41,22 @@
 #include "hardware/clocks.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
+#include "hardware/sync.h"
 #include "pico/time.h"
 #if defined(__has_include) && __has_include("singlewire.pio.h")
 #include "singlewire.pio.h"
+static_assert(sizeof(pu_swio_program_instructions) == sizeof(kPuSwioFallbackInstructions),
+              "singlewire.pio.h instruction count must match fallback array");
+static_assert(pio_fallback_matches_assembled(
+                  pu_swio_program_instructions,
+                  kPuSwioFallbackInstructions,
+                  sizeof(kPuSwioFallbackInstructions) / sizeof(kPuSwioFallbackInstructions[0])),
+              "singlewire.pio.h instructions must match fallback array byte-for-byte");
 #else
-/* Assembled via pioasm from firmware/pio/singlewire.pio (22 instructions) */
 #define pu_swio_wrap_target 0
 #define pu_swio_wrap 21
 #define pu_swio_offset_frame_start 0u
-static constexpr uint16_t pu_swio_program_instructions[] = {
-    0x80a0, 0x6037, 0x7041, 0x1166, 0x05e2, 0x0008, 0xb842, 0x03e2,
-    0x004a, 0x0014, 0x002e, 0xe020, 0x80a0, 0x0002, 0xe03f, 0xb142,
-    0xa442, 0x4b01, 0x004f, 0x8020, 0xe042, 0x0f95,
-};
+#define pu_swio_program_instructions kPuSwioFallbackInstructions
 static constexpr struct pio_program pu_swio_program = {
     pu_swio_program_instructions,
     22,
@@ -104,7 +131,7 @@ constexpr uint32_t kDmCtrlHaltReq      = (1u << 31);
 /* DMSTATUS (0x11) QingKe V2 Table 3-5 bitfields */
 constexpr uint32_t kDmStatVersionMask     = 0x0000000Fu;
 constexpr uint32_t kDmStatVersionQingKeV2 = 0x00000002u;
-constexpr uint32_t kDmStatReservedMask    = 0xFFF00070u; /* [31:20] and [6:4] must be 0 */
+constexpr uint32_t kDmStatReservedMask    = 0xFFB00070u; /* [31:23], [21:20], [6:4] must be 0 */
 constexpr uint32_t kDmStatAuthenticated   = (1u << 7);
 constexpr uint32_t kDmStatAnyHalted       = (1u << 8);
 constexpr uint32_t kDmStatAllHalted       = (1u << 9);
@@ -118,6 +145,7 @@ constexpr uint32_t kDmStatAnyResumeAck    = (1u << 16);
 constexpr uint32_t kDmStatAllResumeAck    = (1u << 17);
 constexpr uint32_t kDmStatAnyHaveReset    = (1u << 18);
 constexpr uint32_t kDmStatAllHaveReset    = (1u << 19);
+constexpr uint32_t kDmStatImpebreak       = (1u << 22);
 
 /* ABSTRACTCS (0x16) bitfields */
 constexpr uint32_t kAbsCsCmdErrMask = (7u << 8);
@@ -148,7 +176,7 @@ constexpr uint32_t kInsnShX9ToX8    = 0x00941023u; /* sh  x9, 0(x8) */
 constexpr uint32_t kInsnSbX9ToX8    = 0x00940023u; /* sb  x9, 0(x8) */
 
 /* CH32V003 Electronic Signature & Flash Controller MMIO */
-constexpr uint32_t kCh32DbgmcuIdcodeAddr = 0x1FFFF704u;
+constexpr uint32_t kCh32DbgmcuIdcodeAddr = 0x1FFFF7C4u;
 constexpr uint32_t kCh32FlashSizeAddr    = 0x1FFFF7E0u;
 constexpr uint32_t kCh32Uid0Addr         = 0x1FFFF7E8u;
 
@@ -197,9 +225,10 @@ uint32_t compute_swio_clkdiv_q16_8(uint32_t sys_hz) {
 }
 
 bool rp2040_swio_push_bounded(uint32_t word, uint32_t timeout_us) {
-    const uint64_t deadline = time_us_64() + timeout_us;
+    const uint64_t t0 = time_us_64();
     while (pio_sm_is_tx_fifo_full(pio1, kSwioPioSm)) {
-        if (time_us_64() >= deadline) {
+        const uint64_t now = time_us_64();
+        if ((now >= t0) && ((now - t0) >= timeout_us)) {
             return false;
         }
     }
@@ -211,9 +240,10 @@ void rp2040_swio_drain_bounded(uint32_t timeout_us) {
     if (!s_pio_loaded) {
         return;
     }
-    const uint64_t deadline = time_us_64() + timeout_us;
+    const uint64_t t0 = time_us_64();
     while (!pio_sm_is_tx_fifo_empty(pio1, kSwioPioSm)) {
-        if (time_us_64() >= deadline) {
+        const uint64_t now = time_us_64();
+        if ((now >= t0) && ((now - t0) >= timeout_us)) {
             break;
         }
     }
@@ -277,17 +307,33 @@ bool rp2040_swio_write_reg(uint8_t reg_addr, uint32_t val, uint32_t timeout_us) 
     const uint32_t eff_timeout = (timeout_us != 0u) ? timeout_us : PU_SWIO_WIRE_TIMEOUT_US;
     const uint32_t hdr = (2u << 9) | (1u << 8) |
                          (static_cast<uint32_t>(reg_addr & 0x7Fu) << 1) | 1u;
-    if (!rp2040_swio_push_bounded(hdr, eff_timeout) ||
-        !rp2040_swio_push_bounded(val, eff_timeout)) {
-        return false;
-    }
-    const uint64_t deadline = time_us_64() + eff_timeout;
-    while (!pio_sm_is_tx_fifo_empty(pio1, kSwioPioSm)) {
-        if (time_us_64() >= deadline) {
+
+    /* Wait until >= 2 of the 4 TX FIFO slots are free, then push header + data
+     * atomically with local IRQs masked so no ISR can inject a >= 18T stop gap! */
+    const uint64_t push_t0 = time_us_64();
+    for (;;) {
+        const uint32_t irq_state = save_and_disable_interrupts();
+        if (pio_sm_get_tx_fifo_level(pio1, kSwioPioSm) <= 2u) {
+            pio_sm_put(pio1, kSwioPioSm, hdr);
+            pio_sm_put(pio1, kSwioPioSm, val);
+            restore_interrupts(irq_state);
+            break;
+        }
+        restore_interrupts(irq_state);
+        const uint64_t now = time_us_64();
+        if ((now >= push_t0) && ((now - push_t0) >= eff_timeout)) {
             return false;
         }
     }
-    busy_wait_us_32(45u);
+
+    const uint64_t drain_t0 = time_us_64();
+    while (!pio_sm_is_tx_fifo_empty(pio1, kSwioPioSm)) {
+        const uint64_t now = time_us_64();
+        if ((now >= drain_t0) && ((now - drain_t0) >= eff_timeout)) {
+            return false;
+        }
+    }
+    busy_wait_us_32(50u);
     return true;
 }
 
@@ -305,9 +351,10 @@ bool rp2040_swio_read_reg(uint8_t reg_addr, uint32_t *out_val, uint32_t timeout_
         *out_val = 0u;
         return false;
     }
-    const uint64_t deadline = time_us_64() + eff_timeout;
+    const uint64_t t0 = time_us_64();
     while (pio_sm_is_rx_fifo_empty(pio1, kSwioPioSm)) {
-        if (time_us_64() >= deadline) {
+        const uint64_t now = time_us_64();
+        if ((now >= t0) && ((now - t0) >= eff_timeout)) {
             *out_val = 0u;
             return false;
         }
@@ -316,15 +363,13 @@ bool rp2040_swio_read_reg(uint8_t reg_addr, uint32_t *out_val, uint32_t timeout_
     return true;
 }
 
-void rp2040_swio_set_vtarg(bool enabled) {
 #if PU_HAS_VTARG_SWITCH
+void rp2040_swio_set_vtarg(bool enabled) {
     gpio_init(PU_PIN_VTARG_EN);
     gpio_put(PU_PIN_VTARG_EN, enabled);
     gpio_set_dir(PU_PIN_VTARG_EN, GPIO_OUT);
-#else
-    (void)enabled;
-#endif
 }
+#endif
 
 void rp2040_swio_delay_us(uint32_t delay_us) {
     busy_wait_us_32(delay_us);
@@ -556,18 +601,42 @@ void fake_exec_progbuf() {
         }
         const uint32_t addr = s_fake.gpr[8];
         if (insn == kInsnLwX9FromX8) {
+            if ((addr & 3u) != 0u) {
+                s_fake.cmderr = 3u;
+                return;
+            }
             s_fake.gpr[9] = fake_mem_read32(addr);
         } else if (insn == kInsnLhuX9FromX8) {
+            if ((addr & 1u) != 0u) {
+                s_fake.cmderr = 3u;
+                return;
+            }
             s_fake.gpr[9] = static_cast<uint32_t>(fake_mem_read8(addr)) |
                             (static_cast<uint32_t>(fake_mem_read8(addr + 1u)) << 8);
         } else if (insn == kInsnLbuX9FromX8) {
+            if (addr >= 0x40000000u || (addr >= 0x1FFFF000u && addr <= 0x1FFFFFFFu)) {
+                s_fake.cmderr = 3u;
+                return;
+            }
             s_fake.gpr[9] = fake_mem_read8(addr);
         } else if (insn == kInsnSwX9ToX8) {
+            if ((addr & 3u) != 0u) {
+                s_fake.cmderr = 3u;
+                return;
+            }
             fake_mem_write32(addr, s_fake.gpr[9]);
         } else if (insn == kInsnShX9ToX8) {
+            if ((addr & 1u) != 0u) {
+                s_fake.cmderr = 3u;
+                return;
+            }
             fake_mem_write8(addr + 0u, static_cast<uint8_t>(s_fake.gpr[9] & 0xFFu));
             fake_mem_write8(addr + 1u, static_cast<uint8_t>((s_fake.gpr[9] >> 8) & 0xFFu));
         } else if (insn == kInsnSbX9ToX8) {
+            if (addr >= 0x40000000u) {
+                s_fake.cmderr = 3u;
+                return;
+            }
             fake_mem_write8(addr, static_cast<uint8_t>(s_fake.gpr[9] & 0xFFu));
         } else {
             s_fake.cmderr = 3u;
@@ -605,6 +674,18 @@ uint64_t host_fake_now_us() {
     return s_fake.sim_time_us;
 }
 
+bool fake_pc_hits_ebreak(uint32_t pc) {
+    const uint16_t hw0 = static_cast<uint16_t>(fake_mem_read8(pc)) |
+                         (static_cast<uint16_t>(fake_mem_read8(pc + 1u)) << 8);
+    if (hw0 == kInsnCEbreak) {
+        return true;
+    }
+    if ((hw0 & 0x3u) == 0x3u && fake_mem_read32(pc) == kInsnEbreak) {
+        return true;
+    }
+    return false;
+}
+
 bool host_fake_read_reg(uint8_t reg_addr, uint32_t *out_val, uint32_t /*timeout_us*/) {
     if (out_val == nullptr) {
         return false;
@@ -631,7 +712,23 @@ bool host_fake_read_reg(uint8_t reg_addr, uint32_t *out_val, uint32_t /*timeout_
         *out_val = s_fake.dm_active ? kDmCtrlDmActive : 0u;
         return true;
     case kDmStatus: {
-        uint32_t st = kDmStatVersionQingKeV2 | kDmStatAuthenticated;
+        if (!s_fake.halted && s_fake.dm_active) {
+            const uint16_t hw0 = static_cast<uint16_t>(fake_mem_read8(s_fake.dpc)) |
+                                 (static_cast<uint16_t>(fake_mem_read8(s_fake.dpc + 1u)) << 8);
+            const uint32_t step_bytes = ((hw0 & 0x3u) == 0x3u) ? 4u : 2u;
+            uint32_t next_pc = s_fake.dpc + step_bytes;
+            if (next_pc >= PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE - 4u) {
+                next_pc = PU_CH32_FLASH_BASE;
+            } else if (s_fake.dpc < PU_CH32_FLASH_SIZE &&
+                       next_pc >= PU_CH32_FLASH_SIZE - 4u) {
+                next_pc = 0u;
+            }
+            s_fake.dpc = next_pc;
+            if ((s_fake.dcsr & kDcsrEbreakM) != 0u && fake_pc_hits_ebreak(s_fake.dpc)) {
+                s_fake.halted = true;
+            }
+        }
+        uint32_t st = kDmStatImpebreak | kDmStatVersionQingKeV2 | kDmStatAuthenticated;
         if (s_fake.halted) {
             st |= (kDmStatAnyHalted | kDmStatAllHalted);
         } else {
@@ -726,6 +823,10 @@ bool host_fake_write_reg(uint8_t reg_addr, uint32_t val, uint32_t /*timeout_us*/
                     }
                     s_fake.halted = true;
                     s_fake.resume_ack = true;
+                } else if ((s_fake.dcsr & kDcsrEbreakM) != 0u &&
+                           fake_pc_hits_ebreak(s_fake.dpc)) {
+                    s_fake.halted = true;
+                    s_fake.resume_ack = true;
                 } else {
                     s_fake.halted = false;
                     s_fake.resume_ack = true;
@@ -817,6 +918,7 @@ const pu_swio_wire_hal_t kHostFakeSwioHal = {
 
 pu_swio_wire_hal_t s_wire = {};
 bool s_wire_initialized = false;
+bool s_has_custom_vtarg_cb = false;
 
 enum class DmStateClass {
     kInvalidNoReply = 0,
@@ -831,10 +933,12 @@ struct SoftBreakpoint {
     uint8_t size;    /* 2 or 4 */
 };
 
-constexpr size_t kMaxBreakpoints = 32u;
-constexpr size_t kMaxGdbRxLen    = 2048u;
-constexpr size_t kMaxGdbTxLen    = 4352u;
-constexpr size_t kMaxMemReadLen  = 1024u;
+constexpr size_t kMaxBreakpoints    = 32u;
+constexpr size_t kMaxGdbRxLen       = 2048u;
+constexpr size_t kMaxGdbRxRingCap   = 8192u;
+constexpr size_t kMaxGdbTxLen       = 4352u;
+constexpr size_t kMaxSingleRspReply = 2112u;
+constexpr size_t kMaxMemReadLen     = 1024u;
 
 SoftBreakpoint s_breakpoints[kMaxBreakpoints] = {};
 uint8_t s_clean_pages[PU_CH32_FLASH_PAGE_COUNT][PU_CH32_FLASH_PAGE_SIZE] = {};
@@ -854,6 +958,8 @@ enum class GdbRxState {
 };
 
 bool s_gdb_session_open = false;
+bool s_gdb_running = false;
+bool s_entered_running_in_feed = false;
 bool s_target_attached_halted = false;
 pu_status_t s_last_session_err = PU_OK;
 
@@ -865,10 +971,16 @@ uint8_t s_rx_expected_csum = 0u;
 uint8_t s_rx_buf[kMaxGdbRxLen] = {};
 size_t s_rx_len = 0u;
 
-char s_tx_queue[kMaxGdbTxLen] = {};
+uint8_t s_rx_ring[kMaxGdbRxRingCap] = {};
+size_t s_rx_ring_head = 0u;
+size_t s_rx_ring_tail = 0u;
+size_t s_rx_ring_count = 0u;
+
+char s_tx_ring[kMaxGdbTxLen] = {};
 size_t s_tx_head = 0u;
 size_t s_tx_tail = 0u;
-char s_last_framed_pkt[kMaxGdbTxLen] = {};
+size_t s_tx_count = 0u;
+char s_last_framed_pkt[kMaxSingleRspReply] = {};
 size_t s_last_framed_len = 0u;
 
 void ensure_wire_initialized() {
@@ -1090,6 +1202,7 @@ bool exec_store_with_saved_scratch(uint32_t store_insn, uint32_t addr, uint32_t 
 }
 
 bool halt_target_bounded(uint64_t start_us) {
+    const uint64_t t0 = wire_now_us(start_us);
     uint32_t dmstatus = 0u;
     if (!wire_read(kDmStatus, &dmstatus)) {
         return false;
@@ -1112,7 +1225,8 @@ bool halt_target_bounded(uint64_t start_us) {
             (void)wire_write(kDmControl, kDmCtrlDmActive);
             return true;
         }
-        if ((wire_now_us(start_us + i * 100u) - start_us) > PU_SWIO_CHECK_TIMEOUT_US) {
+        const uint64_t now = wire_now_us(t0 + static_cast<uint64_t>(i + 1u) * 100u);
+        if ((now >= t0) && ((now - t0) >= PU_SWIO_CHECK_TIMEOUT_US)) {
             break;
         }
     }
@@ -1120,6 +1234,7 @@ bool halt_target_bounded(uint64_t start_us) {
 }
 
 bool resume_target_and_verify(uint64_t start_us) {
+    const uint64_t t0 = wire_now_us(start_us);
     if (!wire_write(kDmControl, kDmCtrlResumeReq | kDmCtrlDmActive)) {
         return false;
     }
@@ -1134,7 +1249,8 @@ bool resume_target_and_verify(uint64_t start_us) {
             saw_running = true;
             break;
         }
-        if ((wire_now_us(start_us + i * 100u) - start_us) > PU_SWIO_CHECK_TIMEOUT_US) {
+        const uint64_t now = wire_now_us(t0 + static_cast<uint64_t>(i + 1u) * 100u);
+        if ((now >= t0) && ((now - t0) >= PU_SWIO_CHECK_TIMEOUT_US)) {
             break;
         }
     }
@@ -1149,6 +1265,60 @@ bool resume_target_and_verify(uint64_t start_us) {
         return false;
     }
     return classify_dmstatus(post_status) == DmStateClass::kRunning;
+}
+
+bool resume_target_for_gdb(uint64_t start_us, DmStateClass *out_state) {
+    if (out_state == nullptr) {
+        return false;
+    }
+    const uint64_t t0 = wire_now_us(start_us);
+    uint32_t dcsr = 0u;
+    if (dm_read_reg(kRegDcsr, &dcsr)) {
+        const uint32_t want_dcsr = (dcsr & ~kDcsrStepBit) | kDcsrEbreakM;
+        if (want_dcsr != dcsr && !dm_write_reg(kRegDcsr, want_dcsr)) {
+            return false;
+        }
+    }
+    if (!wire_write(kDmControl, kDmCtrlResumeReq | kDmCtrlDmActive)) {
+        return false;
+    }
+    DmStateClass acked_state = DmStateClass::kInvalidNoReply;
+    for (uint32_t i = 0u; i < 64u; ++i) {
+        uint32_t dmstatus = 0u;
+        if (!wire_read(kDmStatus, &dmstatus)) {
+            return false;
+        }
+        const DmStateClass cls = classify_dmstatus(dmstatus);
+        if ((dmstatus & kDmStatAllResumeAck) != 0u &&
+            (cls == DmStateClass::kRunning || cls == DmStateClass::kHalted)) {
+            acked_state = cls;
+            break;
+        }
+        const uint64_t now = wire_now_us(t0 + static_cast<uint64_t>(i + 1u) * 100u);
+        if ((now >= t0) && ((now - t0) >= PU_SWIO_CHECK_TIMEOUT_US)) {
+            break;
+        }
+    }
+    if (acked_state == DmStateClass::kInvalidNoReply) {
+        return false;
+    }
+    if (!wire_write(kDmControl, kDmCtrlDmActive)) {
+        return false;
+    }
+    if (acked_state == DmStateClass::kHalted) {
+        *out_state = DmStateClass::kHalted;
+        return true;
+    }
+    uint32_t post_status = 0u;
+    if (!wire_read(kDmStatus, &post_status)) {
+        return false;
+    }
+    const DmStateClass post_cls = classify_dmstatus(post_status);
+    if (post_cls != DmStateClass::kRunning && post_cls != DmStateClass::kHalted) {
+        return false;
+    }
+    *out_state = post_cls;
+    return true;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1319,16 +1489,28 @@ void build_patched_page_image(uint32_t page_idx,
     }
 }
 
-bool set_soft_breakpoint(uint32_t addr, uint32_t kind) {
-    if ((kind != 2u && kind != 4u) || (addr & 1u) != 0u) {
+bool normalize_flash_range(uint32_t addr, uint32_t size, uint32_t *out_offset) {
+    if (size > 0u && (size - 1u) > UINT32_MAX - addr) {
         return false;
     }
-    if (addr < PU_CH32_FLASH_BASE || addr > PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE ||
-        kind > (PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE) - addr) {
-        return false;
+    if (addr <= PU_CH32_FLASH_SIZE && size <= PU_CH32_FLASH_SIZE - addr) {
+        *out_offset = addr;
+        return true;
     }
+    if (addr >= PU_CH32_FLASH_BASE && addr <= PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE &&
+        size <= (PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE) - addr) {
+        *out_offset = addr - PU_CH32_FLASH_BASE;
+        return true;
+    }
+    return false;
+}
 
-    const uint32_t offset = addr - PU_CH32_FLASH_BASE;
+bool set_soft_breakpoint(uint32_t addr, uint32_t kind) {
+    uint32_t offset = 0u;
+    if ((kind != 2u && kind != 4u) || (addr & 1u) != 0u ||
+        !normalize_flash_range(addr, kind, &offset)) {
+        return false;
+    }
     int free_slot = -1;
     for (size_t i = 0u; i < kMaxBreakpoints; ++i) {
         if (!s_breakpoints[i].active) {
@@ -1398,15 +1580,12 @@ bool set_soft_breakpoint(uint32_t addr, uint32_t kind) {
 }
 
 bool clear_soft_breakpoint(uint32_t addr, uint32_t kind) {
-    if ((kind != 2u && kind != 4u) || (addr & 1u) != 0u) {
-        return false;
-    }
-    if (addr < PU_CH32_FLASH_BASE || addr > PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE ||
-        kind > (PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE) - addr) {
+    uint32_t offset = 0u;
+    if ((kind != 2u && kind != 4u) || (addr & 1u) != 0u ||
+        !normalize_flash_range(addr, kind, &offset)) {
         return false;
     }
 
-    const uint32_t offset = addr - PU_CH32_FLASH_BASE;
     for (size_t i = 0u; i < kMaxBreakpoints; ++i) {
         if (!s_breakpoints[i].active || s_breakpoints[i].offset != offset) {
             continue;
@@ -1419,7 +1598,13 @@ bool clear_soft_breakpoint(uint32_t addr, uint32_t kind) {
         for (uint32_t p = p0; p <= p1; ++p) {
             uint8_t desired[PU_CH32_FLASH_PAGE_SIZE] = {};
             build_patched_page_image(p, desired, -1, 0u, static_cast<int>(i));
+            s_page_dirty_restore[p] = true;
             if (!rewrite_flash_page_64(p, desired)) {
+                for (uint32_t rp = p0; rp <= p; ++rp) {
+                    uint8_t rollback_img[PU_CH32_FLASH_PAGE_SIZE] = {};
+                    build_patched_page_image(rp, rollback_img, -1, 0u, -1);
+                    (void)rewrite_flash_page_64(rp, rollback_img);
+                }
                 return false;
             }
         }
@@ -1438,34 +1623,51 @@ bool clear_soft_breakpoint(uint32_t addr, uint32_t kind) {
     return true; /* Duplicate removals are idempotent */
 }
 
-bool restore_all_soft_breakpoints(uint64_t now_us) {
-    bool any_dirty = false;
-    for (size_t p = 0u; p < PU_CH32_FLASH_PAGE_COUNT; ++p) {
-        if (s_page_bp_refcount[p] != 0u || s_page_dirty_restore[p]) {
-            any_dirty = true;
-            break;
+bool has_unrestored_soft_breakpoints() {
+    for (size_t i = 0u; i < kMaxBreakpoints; ++i) {
+        if (s_breakpoints[i].active) {
+            return true;
         }
     }
+    for (size_t p = 0u; p < PU_CH32_FLASH_PAGE_COUNT; ++p) {
+        if (s_page_bp_refcount[p] != 0u || s_page_dirty_restore[p]) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool restore_all_soft_breakpoints(uint64_t now_us) {
+    if (!has_unrestored_soft_breakpoints()) {
+        return true;
+    }
+    if (!halt_target_bounded(now_us)) {
+        return false;
+    }
     bool all_ok = true;
-    if (any_dirty) {
-        if (!halt_target_bounded(now_us)) {
-            all_ok = false;
-        } else {
-            for (uint32_t p = 0u; p < PU_CH32_FLASH_PAGE_COUNT; ++p) {
-                if (s_page_bp_refcount[p] != 0u || s_page_dirty_restore[p]) {
-                    if (rewrite_flash_page_64(p, s_clean_pages[p])) {
-                        s_page_bp_refcount[p] = 0u;
-                        s_page_dirty_restore[p] = false;
-                    } else {
-                        all_ok = false;
-                    }
-                }
+    for (uint32_t p = 0u; p < PU_CH32_FLASH_PAGE_COUNT; ++p) {
+        if (s_page_bp_refcount[p] != 0u || s_page_dirty_restore[p]) {
+            s_page_dirty_restore[p] = true;
+            if (rewrite_flash_page_64(p, s_clean_pages[p])) {
+                s_page_bp_refcount[p] = 0u;
+                s_page_dirty_restore[p] = false;
+            } else {
+                all_ok = false;
             }
         }
     }
-    std::memset(s_breakpoints, 0, sizeof(s_breakpoints));
-    std::memset(s_page_bp_refcount, 0, sizeof(s_page_bp_refcount));
-    std::memset(s_page_dirty_restore, 0, sizeof(s_page_dirty_restore));
+    for (size_t i = 0u; i < kMaxBreakpoints; ++i) {
+        if (!s_breakpoints[i].active) {
+            continue;
+        }
+        const uint32_t p0 = s_breakpoints[i].offset / PU_CH32_FLASH_PAGE_SIZE;
+        const uint32_t p1 = (s_breakpoints[i].offset + s_breakpoints[i].size - 1u) /
+                            PU_CH32_FLASH_PAGE_SIZE;
+        if (!s_page_dirty_restore[p0] && !s_page_dirty_restore[p1]) {
+            s_breakpoints[i].active = false;
+            s_breakpoints[i].size = 0u;
+        }
+    }
     return all_ok;
 }
 
@@ -1476,47 +1678,46 @@ void clear_vflash_cache() {
     std::memset(s_vflash_buf, 0xFF, sizeof(s_vflash_buf));
 }
 
-bool normalize_flash_range(uint32_t addr, uint32_t size, uint32_t *out_offset) {
-    if (size > 0u && (size - 1u) > UINT32_MAX - addr) {
-        return false;
-    }
-    if (addr <= PU_CH32_FLASH_SIZE && size <= PU_CH32_FLASH_SIZE - addr) {
-        *out_offset = addr;
-        return true;
-    }
-    if (addr >= PU_CH32_FLASH_BASE && addr <= PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE &&
-        size <= (PU_CH32_FLASH_BASE + PU_CH32_FLASH_SIZE) - addr) {
-        *out_offset = addr - PU_CH32_FLASH_BASE;
-        return true;
-    }
-    return false;
-}
-
 bool flush_vflash_cache() {
     if (!s_vflash_dirty) {
         return true;
     }
-    uint8_t merged[PU_CH32_FLASH_PAGE_SIZE] = {};
+    const uint32_t page_idx = s_vflash_page_idx;
+    const bool had_bp_snapshot =
+        (s_page_bp_refcount[page_idx] != 0u || s_page_dirty_restore[page_idx]);
+
+    uint8_t clean_merged[PU_CH32_FLASH_PAGE_SIZE] = {};
     if (s_vflash_mask != UINT64_MAX) {
-        ScopedScratchRegs scratch;
-        if (!scratch.save() || !read_flash_page_64_unlocked(s_vflash_page_idx, merged) ||
-            !scratch.restore()) {
-            return false;
+        if (had_bp_snapshot) {
+            std::memcpy(clean_merged, s_clean_pages[page_idx], PU_CH32_FLASH_PAGE_SIZE);
+        } else {
+            ScopedScratchRegs scratch;
+            if (!scratch.save() || !read_flash_page_64_unlocked(page_idx, clean_merged) ||
+                !scratch.restore()) {
+                return false;
+            }
         }
         for (uint32_t i = 0u; i < PU_CH32_FLASH_PAGE_SIZE; ++i) {
             if ((s_vflash_mask & (UINT64_C(1) << i)) != 0u) {
-                merged[i] = s_vflash_buf[i];
+                clean_merged[i] = s_vflash_buf[i];
             }
         }
     } else {
-        std::memcpy(merged, s_vflash_buf, PU_CH32_FLASH_PAGE_SIZE);
+        std::memcpy(clean_merged, s_vflash_buf, PU_CH32_FLASH_PAGE_SIZE);
     }
 
-    if (!rewrite_flash_page_64(s_vflash_page_idx, merged)) {
+    uint8_t prev_clean[PU_CH32_FLASH_PAGE_SIZE] = {};
+    std::memcpy(prev_clean, s_clean_pages[page_idx], PU_CH32_FLASH_PAGE_SIZE);
+    std::memcpy(s_clean_pages[page_idx], clean_merged, PU_CH32_FLASH_PAGE_SIZE);
+
+    uint8_t hw_img[PU_CH32_FLASH_PAGE_SIZE] = {};
+    build_patched_page_image(page_idx, hw_img, -1, 0u, -1);
+    if (!rewrite_flash_page_64(page_idx, hw_img)) {
+        std::memcpy(s_clean_pages[page_idx], prev_clean, PU_CH32_FLASH_PAGE_SIZE);
         return false;
     }
-    if (s_page_bp_refcount[s_vflash_page_idx] != 0u || s_page_dirty_restore[s_vflash_page_idx]) {
-        std::memcpy(s_clean_pages[s_vflash_page_idx], merged, PU_CH32_FLASH_PAGE_SIZE);
+    if (s_page_bp_refcount[page_idx] == 0u) {
+        s_page_dirty_restore[page_idx] = false;
     }
     clear_vflash_cache();
     return true;
@@ -1564,10 +1765,46 @@ uint32_t bswap32_u(uint32_t x) {
            ((x & 0xFF000000u) >> 24);
 }
 
+size_t tx_free_space() {
+    return kMaxGdbTxLen - s_tx_count;
+}
+
 void tx_enqueue_char(char c) {
-    if (s_tx_tail < kMaxGdbTxLen) {
-        s_tx_queue[s_tx_tail++] = c;
+    if (s_tx_count < kMaxGdbTxLen) {
+        s_tx_ring[s_tx_tail] = c;
+        s_tx_tail = (s_tx_tail + 1u) % kMaxGdbTxLen;
+        ++s_tx_count;
     }
+}
+
+size_t tx_drain_to(uint8_t *out, size_t max_bytes) {
+    if (out == nullptr || max_bytes == 0u) {
+        return 0u;
+    }
+    size_t n = 0u;
+    while (s_tx_count > 0u && n < max_bytes) {
+        out[n++] = static_cast<uint8_t>(s_tx_ring[s_tx_head]);
+        s_tx_head = (s_tx_head + 1u) % kMaxGdbTxLen;
+        --s_tx_count;
+    }
+    return n;
+}
+
+bool rx_ring_push(uint8_t b) {
+    if (s_rx_ring_count >= kMaxGdbRxRingCap) {
+        return false;
+    }
+    s_rx_ring[s_rx_ring_tail] = b;
+    s_rx_ring_tail = (s_rx_ring_tail + 1u) % kMaxGdbRxRingCap;
+    ++s_rx_ring_count;
+    return true;
+}
+
+uint8_t rx_ring_pop() {
+    const uint8_t b = s_rx_ring[s_rx_ring_head];
+    s_rx_ring_head = (s_rx_ring_head + 1u) % kMaxGdbRxRingCap;
+    --s_rx_ring_count;
+    return b;
 }
 
 void tx_enqueue_framed_packet(const char *payload, size_t payload_len) {
@@ -1670,19 +1907,22 @@ struct PktCursor {
 };
 
 bool ensure_gdb_swio_session(uint64_t now_us) {
+    bool lost_prior_lease = false;
     if (s_gdb_session_open) {
         pu_status_t st = pu_engine_renew_deadline(PU_ENGINE_SWIO, now_us, PU_SWIO_SESSION_TIMEOUT_US);
         if (st == PU_OK) {
             s_last_session_err = PU_OK;
             return true;
         }
-        /* Session ownership lost due to timeout, USB reset, or hardware fault */
+        /* Session ownership lost due to timeout, USB reset, or hardware fault:
+         * close local PIO1 bus and preserve s_breakpoints/s_clean_pages so any
+         * ebreak patches still in flash can be restored on reconnect/disconnect. */
+        wire_bus_close();
         s_gdb_session_open = false;
+        s_gdb_running = false;
         s_target_attached_halted = false;
         clear_vflash_cache();
-        std::memset(s_breakpoints, 0, sizeof(s_breakpoints));
-        std::memset(s_page_bp_refcount, 0, sizeof(s_page_bp_refcount));
-        std::memset(s_page_dirty_restore, 0, sizeof(s_page_dirty_restore));
+        lost_prior_lease = true;
         if (st == PU_ERR_FAULT_LATCHED) {
             s_last_session_err = st;
             return false;
@@ -1703,8 +1943,12 @@ bool ensure_gdb_swio_session(uint64_t now_us) {
         return false;
     }
     s_gdb_session_open = true;
+    s_gdb_running = false;
     s_target_attached_halted = false;
     s_last_session_err = PU_OK;
+    if (lost_prior_lease || has_unrestored_soft_breakpoints()) {
+        (void)restore_all_soft_breakpoints(now_us);
+    }
     return true;
 }
 
@@ -1718,6 +1962,7 @@ bool ensure_gdb_target_halted(uint64_t now_us) {
         s_target_attached_halted = false;
         return false;
     }
+    s_gdb_running = false;
     if (!s_target_attached_halted) {
         uint32_t dcsr = 0u;
         if (dm_read_reg(kRegDcsr, &dcsr)) {
@@ -1777,20 +2022,84 @@ bool is_writable_ch32_ram_or_mmio(uint32_t addr, uint32_t len) {
     return false;
 }
 
-bool read_target_clean_byte(uint32_t addr, uint8_t *out_byte) {
+uint8_t overlay_clean_flash_byte(uint32_t addr, uint8_t raw_byte) {
     uint32_t flash_off = 0u;
     if (normalize_flash_range(addr, 1u, &flash_off)) {
         const uint32_t page_idx = flash_off / PU_CH32_FLASH_PAGE_SIZE;
-        if (s_page_bp_refcount[page_idx] != 0u) {
-            *out_byte = s_clean_pages[page_idx][flash_off % PU_CH32_FLASH_PAGE_SIZE];
-            return true;
+        if (s_page_bp_refcount[page_idx] != 0u || s_page_dirty_restore[page_idx]) {
+            return s_clean_pages[page_idx][flash_off % PU_CH32_FLASH_PAGE_SIZE];
         }
     }
-    uint32_t val = 0u;
-    if (!exec_load_with_saved_scratch(kInsnLbuX9FromX8, addr, &val)) {
-        return false;
+    return raw_byte;
+}
+
+bool read_target_clean_range(uint32_t addr, uint8_t *out_bytes, uint32_t len) {
+    uint32_t i = 0u;
+    while (i < len) {
+        const uint32_t cur_addr = addr + i;
+        const uint32_t rem = len - i;
+        if ((cur_addr & 3u) == 0u && rem >= 4u) {
+            uint32_t word = 0u;
+            if (!exec_load_with_saved_scratch(kInsnLwX9FromX8, cur_addr, &word)) {
+                return false;
+            }
+            for (uint32_t b = 0u; b < 4u; ++b) {
+                const uint8_t raw = static_cast<uint8_t>((word >> (b * 8u)) & 0xFFu);
+                out_bytes[i + b] = overlay_clean_flash_byte(cur_addr + b, raw);
+            }
+            i += 4u;
+        } else if ((cur_addr & 1u) == 0u && rem >= 2u) {
+            uint32_t hw = 0u;
+            if (!exec_load_with_saved_scratch(kInsnLhuX9FromX8, cur_addr, &hw)) {
+                return false;
+            }
+            for (uint32_t b = 0u; b < 2u; ++b) {
+                const uint8_t raw = static_cast<uint8_t>((hw >> (b * 8u)) & 0xFFu);
+                out_bytes[i + b] = overlay_clean_flash_byte(cur_addr + b, raw);
+            }
+            i += 2u;
+        } else {
+            uint32_t byte_val = 0u;
+            if (!exec_load_with_saved_scratch(kInsnLbuX9FromX8, cur_addr, &byte_val)) {
+                return false;
+            }
+            out_bytes[i] = overlay_clean_flash_byte(cur_addr, static_cast<uint8_t>(byte_val & 0xFFu));
+            i += 1u;
+        }
     }
-    *out_byte = static_cast<uint8_t>(val & 0xFFu);
+    return true;
+}
+
+bool write_target_range(uint32_t addr, const uint8_t *bytes, uint32_t len) {
+    uint32_t i = 0u;
+    while (i < len) {
+        const uint32_t cur_addr = addr + i;
+        const uint32_t rem = len - i;
+        if ((cur_addr & 3u) == 0u && rem >= 4u) {
+            const uint32_t word =
+                static_cast<uint32_t>(bytes[i + 0u]) |
+                (static_cast<uint32_t>(bytes[i + 1u]) << 8) |
+                (static_cast<uint32_t>(bytes[i + 2u]) << 16) |
+                (static_cast<uint32_t>(bytes[i + 3u]) << 24);
+            if (!exec_store_with_saved_scratch(kInsnSwX9ToX8, cur_addr, word)) {
+                return false;
+            }
+            i += 4u;
+        } else if ((cur_addr & 1u) == 0u && rem >= 2u) {
+            const uint32_t hw =
+                static_cast<uint32_t>(bytes[i + 0u]) |
+                (static_cast<uint32_t>(bytes[i + 1u]) << 8);
+            if (!exec_store_with_saved_scratch(kInsnShX9ToX8, cur_addr, hw)) {
+                return false;
+            }
+            i += 2u;
+        } else {
+            if (!exec_store_with_saved_scratch(kInsnSbX9ToX8, cur_addr, bytes[i])) {
+                return false;
+            }
+            i += 1u;
+        }
+    }
     return true;
 }
 
@@ -1945,6 +2254,25 @@ void handle_valid_gdb_packet(uint64_t now_us) {
         return;
     }
 
+    if (cur.match_exact("k")) {
+        clear_vflash_cache();
+        if (s_gdb_session_open || has_unrestored_soft_breakpoints()) {
+            if (ensure_gdb_swio_session(now_us)) {
+                (void)restore_all_soft_breakpoints(now_us);
+                (void)resume_target_and_verify(now_us);
+                (void)reset_interface_to_power_on();
+            }
+        }
+        wire_bus_close();
+        if (pu_engine_current() == PU_ENGINE_SWIO) {
+            (void)pu_engine_release(PU_ENGINE_SWIO);
+        }
+        s_gdb_session_open = false;
+        s_gdb_running = false;
+        s_target_attached_halted = false;
+        return;
+    }
+
     if (!ensure_gdb_swio_session(now_us)) {
         tx_enqueue_cstr_packet("Eeb");
         return;
@@ -2024,6 +2352,7 @@ void handle_valid_gdb_packet(uint64_t now_us) {
         wire_bus_close();
         (void)pu_engine_release(PU_ENGINE_SWIO);
         s_gdb_session_open = false;
+        s_gdb_running = false;
         s_target_attached_halted = false;
         tx_enqueue_cstr_packet("OK");
         return;
@@ -2155,13 +2484,14 @@ void handle_valid_gdb_packet(uint64_t now_us) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
+        uint8_t raw_bytes[kMaxMemReadLen] = {};
+        if (!read_target_clean_range(addr, raw_bytes, len)) {
+            tx_enqueue_cstr_packet("E01");
+            return;
+        }
         char hex_out[kMaxMemReadLen * 2u] = {};
         for (uint32_t i = 0u; i < len; ++i) {
-            uint8_t b = 0u;
-            if (!read_target_clean_byte(addr + i, &b)) {
-                tx_enqueue_cstr_packet("E01");
-                return;
-            }
+            const uint8_t b = raw_bytes[i];
             hex_out[i * 2u + 0u] = to_hex_char(static_cast<uint8_t>(b >> 4));
             hex_out[i * 2u + 1u] = to_hex_char(static_cast<uint8_t>(b & 0x0Fu));
         }
@@ -2205,11 +2535,9 @@ void handle_valid_gdb_packet(uint64_t now_us) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
-        for (uint32_t i = 0u; i < len; ++i) {
-            if (!exec_store_with_saved_scratch(kInsnSbX9ToX8, addr + i, bytes[i])) {
-                tx_enqueue_cstr_packet("E01");
-                return;
-            }
+        if (!write_target_range(addr, bytes, len)) {
+            tx_enqueue_cstr_packet("E01");
+            return;
         }
         if (!scratch.restore()) {
             tx_enqueue_cstr_packet("E01");
@@ -2267,13 +2595,57 @@ void handle_valid_gdb_packet(uint64_t now_us) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
+        const uint32_t first_page = flash_off / PU_CH32_FLASH_PAGE_SIZE;
+        const uint32_t num_pages  = size / PU_CH32_FLASH_PAGE_SIZE;
+        const uint32_t end_page   = first_page + num_pages;
+        if (s_vflash_dirty && s_vflash_page_idx >= first_page && s_vflash_page_idx < end_page) {
+            clear_vflash_cache();
+        }
+        for (size_t i = 0u; i < kMaxBreakpoints; ++i) {
+            if (!s_breakpoints[i].active) {
+                continue;
+            }
+            const uint32_t bp_p0 = s_breakpoints[i].offset / PU_CH32_FLASH_PAGE_SIZE;
+            const uint32_t bp_p1 = (s_breakpoints[i].offset + s_breakpoints[i].size - 1u) /
+                                   PU_CH32_FLASH_PAGE_SIZE;
+            const bool p0_erased = (bp_p0 >= first_page && bp_p0 < end_page);
+            const bool p1_erased = (bp_p1 >= first_page && bp_p1 < end_page);
+            if (!p0_erased && !p1_erased) {
+                continue;
+            }
+            if (bp_p0 != bp_p1 && !p0_erased) {
+                uint8_t unpatched[PU_CH32_FLASH_PAGE_SIZE] = {};
+                build_patched_page_image(bp_p0, unpatched, -1, 0u, static_cast<int>(i));
+                if (!rewrite_flash_page_64(bp_p0, unpatched)) {
+                    tx_enqueue_cstr_packet("E01");
+                    return;
+                }
+            }
+            if (bp_p0 != bp_p1 && !p1_erased) {
+                uint8_t unpatched[PU_CH32_FLASH_PAGE_SIZE] = {};
+                build_patched_page_image(bp_p1, unpatched, -1, 0u, static_cast<int>(i));
+                if (!rewrite_flash_page_64(bp_p1, unpatched)) {
+                    tx_enqueue_cstr_packet("E01");
+                    return;
+                }
+            }
+            s_breakpoints[i].active = false;
+            s_breakpoints[i].size = 0u;
+            for (uint32_t p = bp_p0; p <= bp_p1; ++p) {
+                if (s_page_bp_refcount[p] > 0u) {
+                    --s_page_bp_refcount[p];
+                }
+                if (s_page_bp_refcount[p] == 0u && !(p >= first_page && p < end_page)) {
+                    s_page_dirty_restore[p] = false;
+                }
+            }
+        }
+
         ScopedScratchRegs scratch;
         if (!scratch.save() || !unlock_ch32_fast_flash()) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
-        const uint32_t first_page = flash_off / PU_CH32_FLASH_PAGE_SIZE;
-        const uint32_t num_pages  = size / PU_CH32_FLASH_PAGE_SIZE;
         bool ok = true;
         for (uint32_t p = 0u; p < num_pages; ++p) {
             const uint32_t page_idx = first_page + p;
@@ -2281,9 +2653,9 @@ void handle_valid_gdb_packet(uint64_t now_us) {
                 ok = false;
                 break;
             }
-            if (s_page_bp_refcount[page_idx] != 0u || s_page_dirty_restore[page_idx]) {
-                std::memset(s_clean_pages[page_idx], 0xFF, PU_CH32_FLASH_PAGE_SIZE);
-            }
+            std::memset(s_clean_pages[page_idx], 0xFF, PU_CH32_FLASH_PAGE_SIZE);
+            s_page_bp_refcount[page_idx] = 0u;
+            s_page_dirty_restore[page_idx] = false;
         }
         lock_ch32_flash();
         if (!scratch.restore() || !ok) {
@@ -2350,16 +2722,23 @@ void handle_valid_gdb_packet(uint64_t now_us) {
             return;
         }
         uint32_t crc = 0xFFFFFFFFu;
-        for (uint32_t i = 0u; i < len; ++i) {
-            uint8_t b = 0u;
-            if (!read_target_clean_byte(addr + i, &b)) {
+        uint32_t offset = 0u;
+        while (offset < len) {
+            uint8_t chunk[256] = {};
+            const uint32_t n_chunk = (len - offset > sizeof(chunk))
+                                         ? static_cast<uint32_t>(sizeof(chunk))
+                                         : (len - offset);
+            if (!read_target_clean_range(addr + offset, chunk, n_chunk)) {
                 tx_enqueue_cstr_packet("E01");
                 return;
             }
-            crc ^= static_cast<uint32_t>(b) << 24;
-            for (unsigned bit = 0u; bit < 8u; ++bit) {
-                crc = (crc << 1) ^ ((crc & 0x80000000u) != 0u ? 0x04C11DB7u : 0u);
+            for (uint32_t i = 0u; i < n_chunk; ++i) {
+                crc ^= static_cast<uint32_t>(chunk[i]) << 24;
+                for (unsigned bit = 0u; bit < 8u; ++bit) {
+                    crc = (crc << 1) ^ ((crc & 0x80000000u) != 0u ? 0x04C11DB7u : 0u);
+                }
             }
+            offset += n_chunk;
         }
         if (!scratch.restore()) {
             tx_enqueue_cstr_packet("E01");
@@ -2468,12 +2847,20 @@ void handle_valid_gdb_packet(uint64_t now_us) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
-        if (!resume_target_and_verify(now_us)) {
+        DmStateClass post_state = DmStateClass::kInvalidNoReply;
+        if (!resume_target_for_gdb(now_us, &post_state)) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
-        s_target_attached_halted = false;
-        tx_enqueue_cstr_packet("OK");
+        if (post_state == DmStateClass::kHalted) {
+            s_gdb_running = false;
+            s_target_attached_halted = true;
+            tx_enqueue_cstr_packet("T05");
+        } else {
+            s_gdb_running = true;
+            s_entered_running_in_feed = true;
+            s_target_attached_halted = false;
+        }
         return;
     }
 
@@ -2497,8 +2884,10 @@ void feed_single_gdb_byte(uint8_t b, uint64_t now_us) {
             }
         } else if (b == 0x03u) {
             if (ensure_gdb_swio_session(now_us) && ensure_gdb_target_halted(now_us)) {
-                tx_enqueue_cstr_packet("T05");
+                s_gdb_running = false;
+                tx_enqueue_cstr_packet("T02");
             } else {
+                s_gdb_running = false;
                 tx_enqueue_cstr_packet("E01");
             }
         }
@@ -2576,6 +2965,45 @@ void feed_single_gdb_byte(uint8_t b, uint64_t now_us) {
     }
 }
 
+void pump_rx_ring(uint64_t now_us) {
+    while (s_rx_ring_count > 0u) {
+        const uint8_t next_b = s_rx_ring[s_rx_ring_head];
+        const bool may_emit_tx =
+            (s_rx_state == GdbRxState::kCsum2) ||
+            (s_rx_state == GdbRxState::kIdle && (next_b == '-' || next_b == 0x03u));
+        if (may_emit_tx && tx_free_space() < kMaxSingleRspReply) {
+            break;
+        }
+        feed_single_gdb_byte(rx_ring_pop(), now_us);
+    }
+}
+
+void poll_gdb_session_state(uint64_t now_us) {
+    if (!s_gdb_session_open) {
+        return;
+    }
+    const pu_status_t st =
+        pu_engine_renew_deadline(PU_ENGINE_SWIO, now_us, PU_SWIO_SESSION_TIMEOUT_US);
+    if (st != PU_OK) {
+        wire_bus_close();
+        s_gdb_session_open = false;
+        s_gdb_running = false;
+        s_target_attached_halted = false;
+        clear_vflash_cache();
+        return;
+    }
+    if (s_gdb_running && !s_entered_running_in_feed && tx_free_space() >= 16u) {
+        uint32_t dmstatus = 0u;
+        if (wire_read(kDmStatus, &dmstatus) &&
+            classify_dmstatus(dmstatus) == DmStateClass::kHalted) {
+            (void)wire_write(kDmControl, kDmCtrlDmActive);
+            s_gdb_running = false;
+            s_target_attached_halted = true;
+            tx_enqueue_cstr_packet("T05");
+        }
+    }
+}
+
 } // namespace
 
 /* -------------------------------------------------------------------------- */
@@ -2586,15 +3014,20 @@ extern "C" {
 
 void pu_swio_init(const pu_swio_wire_hal_t *hal) {
     pu_ch32_on_disconnect();
+    std::memset(s_breakpoints, 0, sizeof(s_breakpoints));
+    std::memset(s_page_bp_refcount, 0, sizeof(s_page_bp_refcount));
+    std::memset(s_page_dirty_restore, 0, sizeof(s_page_dirty_restore));
     if (hal != nullptr) {
         s_wire = *hal;
         if (s_wire.sys_clock_hz == 0u) {
             s_wire.sys_clock_hz = 125000000u;
         }
+        s_has_custom_vtarg_cb = (hal->set_vtarg_power != nullptr);
         s_wire_initialized = true;
         return;
     }
 
+    s_has_custom_vtarg_cb = false;
 #if !defined(PU_HOST_TEST)
     std::memset(&s_wire, 0, sizeof(s_wire));
     uint32_t clk = clock_get_hz(clk_sys);
@@ -2604,11 +3037,18 @@ void pu_swio_init(const pu_swio_wire_hal_t *hal) {
     s_wire.bus_reset = rp2040_swio_bus_reset;
     s_wire.read_reg = rp2040_swio_read_reg;
     s_wire.write_reg = rp2040_swio_write_reg;
+#if PU_HAS_VTARG_SWITCH
     s_wire.set_vtarg_power = rp2040_swio_set_vtarg;
+#else
+    s_wire.set_vtarg_power = nullptr;
+#endif
     s_wire.delay_us = rp2040_swio_delay_us;
     s_wire.now_us = rp2040_swio_now_us;
 #else
     s_wire = kHostFakeSwioHal;
+#if !PU_HAS_VTARG_SWITCH
+    s_wire.set_vtarg_power = nullptr;
+#endif
 #endif
     s_wire_initialized = true;
 }
@@ -2724,31 +3164,54 @@ size_t pu_ch32_gdb_feed(const uint8_t *in,
                         size_t out_cap,
                         uint64_t now_us) {
     ensure_wire_initialized();
-    if (s_tx_head == s_tx_tail) {
-        s_tx_head = 0u;
-        s_tx_tail = 0u;
-    }
-    if (in != nullptr) {
-        for (size_t i = 0u; i < len; ++i) {
-            feed_single_gdb_byte(in[i], now_us);
+    s_entered_running_in_feed = false;
+
+    size_t written = 0u;
+    size_t in_pos = 0u;
+
+    for (;;) {
+        if (in != nullptr) {
+            while (in_pos < len && rx_ring_push(in[in_pos])) {
+                ++in_pos;
+            }
+        }
+        pump_rx_ring(now_us);
+        if (out != nullptr && written < out_cap) {
+            written += tx_drain_to(out + written, out_cap - written);
+        }
+        pump_rx_ring(now_us);
+        if (out != nullptr && written < out_cap) {
+            written += tx_drain_to(out + written, out_cap - written);
+        }
+        if (in == nullptr || in_pos >= len || s_rx_ring_count >= kMaxGdbRxRingCap) {
+            break;
         }
     }
 
-    size_t written = 0u;
-    if (out != nullptr && out_cap > 0u) {
-        while (s_tx_head < s_tx_tail && written < out_cap) {
-            out[written++] = static_cast<uint8_t>(s_tx_queue[s_tx_head++]);
-        }
-    }
-    if (s_tx_head == s_tx_tail) {
-        s_tx_head = 0u;
-        s_tx_tail = 0u;
+    poll_gdb_session_state(now_us);
+    s_entered_running_in_feed = false;
+    if (out != nullptr && written < out_cap) {
+        written += tx_drain_to(out + written, out_cap - written);
     }
     return written;
 }
 
+size_t pu_ch32_gdb_poll(uint8_t *out, size_t out_cap, uint64_t now_us) {
+    return pu_ch32_gdb_feed(nullptr, 0u, out, out_cap, now_us);
+}
+
 pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us) {
     ensure_wire_initialized();
+#if !PU_HAS_VTARG_SWITCH
+    if (!s_has_custom_vtarg_cb || s_wire.set_vtarg_power == nullptr) {
+        return PU_ERR_INVALID_ARG;
+    }
+#else
+    if (s_wire.set_vtarg_power == nullptr) {
+        return PU_ERR_INVALID_ARG;
+    }
+#endif
+
     const pu_status_t acq = pu_engine_acquire(PU_ENGINE_RECOVERY, now_us, PU_SWIO_RECOVERY_TIMEOUT_US);
     if (acq != PU_OK) {
         return acq;
@@ -2761,55 +3224,93 @@ pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us) {
         }
     } release_guard;
 
-    if (s_wire.set_vtarg_power != nullptr) {
-        wire_bus_close();
-        s_wire.set_vtarg_power(false);
-        if (s_wire.delay_us != nullptr) {
-            s_wire.delay_us(50000u);
-        }
-        s_wire.set_vtarg_power(true);
-        if (s_wire.delay_us != nullptr) {
-            s_wire.delay_us(1500u);
-        }
+    wire_bus_close();
+    s_wire.set_vtarg_power(false);
+    if (s_wire.delay_us != nullptr) {
+        s_wire.delay_us(50000u);
     }
 
-    /* Immediately seize SWIO & assert halt + system reset before user sketch runs */
+    /* Open SWIO bus and turn VTARG ON with ZERO blind sleep: immediately poll
+     * DMCONTROL = 0x80000001 across POR so PD1-reusing sketches never reach main(). */
     wire_bus_open();
-    if (!enable_swio_link_and_dm() ||
-        !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlNdmReset | kDmCtrlDmActive) ||
-        !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive) ||
-        !halt_target_bounded(now_us)) {
+    s_wire.set_vtarg_power(true);
+
+    const uint64_t t0 = wire_now_us(now_us);
+    bool caught = false;
+    for (uint32_t attempt = 0u; attempt < 4096u; ++attempt) {
+        (void)wire_write(kWchDmShdwCfgr, kWchCfgrKey | kWchCfgrOutEnBit);
+        (void)wire_write(kWchDmCfgr, kWchCfgrKey | kWchCfgrOutEnBit);
+        if (wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlDmActive)) {
+            uint32_t dmstatus = 0u;
+            if (wire_read(kDmStatus, &dmstatus) &&
+                classify_dmstatus(dmstatus) == DmStateClass::kHalted) {
+                caught = true;
+                break;
+            }
+        }
+        if (s_wire.bus_reset != nullptr && ((attempt & 0x7u) == 0x7u)) {
+            s_wire.bus_reset();
+        }
+        const uint64_t now = wire_now_us(t0 + static_cast<uint64_t>(attempt + 1u) * 50u);
+        if ((now >= t0) && ((now - t0) >= PU_SWIO_RECOVERY_TIMEOUT_US)) {
+            break;
+        }
+    }
+    if (!caught) {
         return PU_ERR_TIMEOUT;
     }
-    (void)reset_interface_to_power_on();
+    if (!wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlNdmReset | kDmCtrlDmActive) ||
+        !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive) ||
+        !halt_target_bounded(now_us) ||
+        !wire_write(kDmControl, kDmCtrlDmActive)) {
+        return PU_ERR_TIMEOUT;
+    }
+    /* Do NOT call reset_interface_to_power_on(): leave chip HALTED with DMACTIVE=1. */
     return PU_OK;
 }
 
 void pu_ch32_on_disconnect(void) {
     clear_vflash_cache();
-    if (s_gdb_session_open && pu_engine_current() == PU_ENGINE_SWIO) {
-        const uint64_t now = wire_now_us(0u);
-        (void)restore_all_soft_breakpoints(now);
-        if (s_target_attached_halted) {
-            (void)resume_target_and_verify(now);
+    const uint64_t now = wire_now_us(0u);
+    const bool had_bps = has_unrestored_soft_breakpoints();
+    if (pu_engine_current() == PU_ENGINE_SWIO) {
+        if (s_gdb_session_open || had_bps) {
+            (void)enable_swio_link_and_dm();
+            (void)restore_all_soft_breakpoints(now);
+            if (s_target_attached_halted || had_bps) {
+                (void)resume_target_and_verify(now);
+            }
+            (void)reset_interface_to_power_on();
         }
-        (void)reset_interface_to_power_on();
+        wire_bus_close();
+        (void)pu_engine_release(PU_ENGINE_SWIO);
+    } else if (had_bps &&
+               pu_engine_acquire(PU_ENGINE_SWIO, now, PU_SWIO_CHECK_TIMEOUT_US) == PU_OK) {
+        wire_bus_open();
+        if (enable_swio_link_and_dm()) {
+            (void)restore_all_soft_breakpoints(now);
+            (void)resume_target_and_verify(now);
+            (void)reset_interface_to_power_on();
+        }
         wire_bus_close();
         (void)pu_engine_release(PU_ENGINE_SWIO);
     } else {
-        std::memset(s_breakpoints, 0, sizeof(s_breakpoints));
-        std::memset(s_page_bp_refcount, 0, sizeof(s_page_bp_refcount));
-        std::memset(s_page_dirty_restore, 0, sizeof(s_page_dirty_restore));
+        wire_bus_close();
     }
     s_gdb_session_open = false;
+    s_gdb_running = false;
     s_target_attached_halted = false;
     s_last_session_err = PU_OK;
     s_rx_state = GdbRxState::kIdle;
     s_rx_escaped = false;
     s_rx_error = false;
     s_rx_len = 0u;
+    s_rx_ring_head = 0u;
+    s_rx_ring_tail = 0u;
+    s_rx_ring_count = 0u;
     s_tx_head = 0u;
     s_tx_tail = 0u;
+    s_tx_count = 0u;
     s_last_framed_len = 0u;
 }
 
@@ -2817,6 +3318,9 @@ void pu_ch32_on_disconnect(void) {
 
 void pu_swio_set_fake_wire_mode(pu_fake_wire_mode_t mode) {
     pu_ch32_on_disconnect();
+    std::memset(s_breakpoints, 0, sizeof(s_breakpoints));
+    std::memset(s_page_bp_refcount, 0, sizeof(s_page_bp_refcount));
+    std::memset(s_page_dirty_restore, 0, sizeof(s_page_dirty_restore));
     const pu_engine_state_t cur_eng = pu_engine_current();
     if (cur_eng == PU_ENGINE_FAULT) {
         (void)pu_engine_clear_fault();
@@ -2855,6 +3359,13 @@ void pu_swio_inject_fake_flash_write_fail(int fail_on_write_index) {
 
 bool pu_swio_fake_flash_matches_original(void) {
     return std::memcmp(s_fake.flash, s_fake.original_flash, PU_CH32_FLASH_SIZE) == 0;
+}
+
+const uint16_t *pu_swio_get_pio_instructions(size_t *out_count) {
+    if (out_count != nullptr) {
+        *out_count = sizeof(kPuSwioFallbackInstructions) / sizeof(kPuSwioFallbackInstructions[0]);
+    }
+    return kPuSwioFallbackInstructions;
 }
 
 pu_status_t pu_ch32_gdb_send_checked(const char *packet_without_csum,
