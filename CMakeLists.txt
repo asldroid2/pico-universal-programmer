@@ -18,8 +18,10 @@ endif()
 
 if(PU_SLOT STREQUAL "A")
     set(PU_SLOT_NAME "app_slot_a")
+    set(PU_SLOT_UF2_FLAG "--slot-a")
 elseif(PU_SLOT STREQUAL "B")
     set(PU_SLOT_NAME "app_slot_b")
+    set(PU_SLOT_UF2_FLAG "--slot-b")
 else()
     message(FATAL_ERROR "Unsupported PU_SLOT='${PU_SLOT}'. Expected A or B.")
 endif()
@@ -150,10 +152,10 @@ if(Python3_FOUND)
     add_custom_target(pu_unified_uf2
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_LIST_DIR}/tools/package_uf2.py
             --bootloader $<TARGET_FILE_DIR:pu_bootloader>/pu_bootloader.bin
-            --slot-a $<TARGET_FILE_DIR:pu_firmware>/pu_firmware.bin
-            --output ${CMAKE_CURRENT_BINARY_DIR}/pico_universal_${PU_BOARD}.uf2
+            ${PU_SLOT_UF2_FLAG} $<TARGET_FILE_DIR:pu_firmware>/pu_firmware.bin
+            --output ${CMAKE_CURRENT_BINARY_DIR}/pico_universal_${PU_BOARD}_slot${PU_SLOT}.uf2
             --verify-rom-model
         DEPENDS pu_bootloader pu_firmware
-        COMMENT "Packaging verified 4 KiB sector-padded unified UF2 (${PU_BOARD})"
+        COMMENT "Packaging verified 4 KiB sector-padded unified UF2 (${PU_BOARD}, Slot ${PU_SLOT})"
     )
 endif()

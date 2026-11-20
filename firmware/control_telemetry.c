@@ -113,6 +113,10 @@ void pu_telemetry_on_overcurrent_irq(void) {
     pu_engine_latch_fault(PU_FAULT_OVERCURRENT);
 }
 
+bool pu_ctrl_is_bootsel_pending(void) {
+    return __atomic_load_n(&s_bootsel_pending, __ATOMIC_ACQUIRE);
+}
+
 bool pu_ctrl_poll_deferred_bootsel(void) {
     if (!__atomic_exchange_n(&s_bootsel_pending, false, __ATOMIC_ACQ_REL)) {
         return false;

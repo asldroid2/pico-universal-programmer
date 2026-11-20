@@ -891,11 +891,13 @@ void pu_dap_on_usb_disconnect(void) {
     s_transfer_abort = false;
     if (s_active_port != DAP_PORT_DISABLED) {
         pu_engine_state_t expected = port_to_engine_state(s_active_port);
+        /* Always release SIO overrides and PIO0 pins even if engine_owner already
+         * transitioned to IDLE (USB reset) or FAULT (overcurrent IRQ). */
+        release_sio_overrides_if_active();
+        if (s_wire.port_off != NULL) {
+            s_wire.port_off();
+        }
         if (pu_engine_current() == expected) {
-            release_sio_overrides_if_active();
-            if (s_wire.port_off != NULL) {
-                s_wire.port_off();
-            }
             (void)pu_engine_release(expected);
         }
         s_active_port = DAP_PORT_DISABLED;

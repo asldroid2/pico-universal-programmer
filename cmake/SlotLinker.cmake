@@ -17,15 +17,11 @@ function(pu_configure_flash_slot TARGET SLOT_NAME WITH_BOOT2)
         if(PNAME STREQUAL "${SLOT_NAME}")
             string(JSON POFFSET GET "${LAYOUT_JSON}" partitions ${I} offset)
             string(JSON PSIZE GET "${LAYOUT_JSON}" partitions ${I} size)
-            if(WITH_BOOT2)
-                math(EXPR SLOT_ORIGIN "${FLASH_BASE} + ${POFFSET}" OUTPUT_FORMAT HEXADECIMAL)
-                set(SLOT_LENGTH "${PSIZE}")
-            else()
-                # Reserve first 256 bytes for pu_image_descriptor_t stamped by package_uf2.py;
-                # vector table and Reset_Handler start cleanly at slot_base + 0x100.
-                math(EXPR SLOT_ORIGIN "${FLASH_BASE} + ${POFFSET} + 256" OUTPUT_FORMAT HEXADECIMAL)
-                math(EXPR SLOT_LENGTH "${PSIZE} - 256")
-            endif()
+            # Both bootloader and chainloaded A/B slots link at their partition base so
+            # Pico SDK's 256-byte .boot2 occupies +0x000..0x0FF and .vectors starts at
+            # +0x100; tools/package_uf2.py overwrites slot +0x000..0x0FF with pu_image_descriptor_t.
+            math(EXPR SLOT_ORIGIN "${FLASH_BASE} + ${POFFSET}" OUTPUT_FORMAT HEXADECIMAL)
+            set(SLOT_LENGTH "${PSIZE}")
             set(FOUND TRUE)
         endif()
     endforeach()
@@ -51,15 +47,6 @@ function(pu_configure_flash_slot TARGET SLOT_NAME WITH_BOOT2)
         "INCLUDE \"pico_flash_region.ld\""
         "FLASH(rx) : ORIGIN = ${SLOT_ORIGIN}, LENGTH = ${SLOT_LENGTH}"
         LD_CONTENT "${LD_CONTENT}")
-
-    if(NOT WITH_BOOT2)
-        # Strip .boot2 input section so slot payload begins immediately with .vectors at +0x100
-        string(REGEX REPLACE
-            "\\.boot2[ \t]*:[ \t]*\\{[^}]*\\}[ \t]*>[ \t]*FLASH"
-            "/* .boot2 omitted for chainloaded A/B slot; bootloader provides stage2 */"
-            LD_CONTENT "${LD_CONTENT}")
-        pico_set_boot_stage2(${TARGET} boot2_generic_03h)
-    endif()
 
     set(GEN_LD "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_${SLOT_NAME}.ld")
     file(WRITE "${GEN_LD}" "${LD_CONTENT}")

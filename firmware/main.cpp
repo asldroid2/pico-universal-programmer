@@ -285,6 +285,7 @@ void core1_protocol_worker(void) {
     uint8_t dap_resp[PU_DAP_PACKET_SIZE];
     uint8_t swio_in[64];
     uint8_t swio_out[128];
+    bool fault_quiesced = false;
 
     for (;;) {
         uint64_t now_us = time_us_64();
@@ -301,36 +302,48 @@ void core1_protocol_worker(void) {
         }
 
         if (pu_engine_current() == PU_ENGINE_FAULT) {
-            /* Keep PIO0/PIO1 quiescent while hardware fault is latched */
-            __atomic_store_n(&g_ch32_unbrick_pending, false, __ATOMIC_RELEASE);
-            pu_dap_on_usb_disconnect();
-            pu_ch32_on_disconnect();
+            /* Quiesce PIO0/PIO1 & drain stale queues ONCE per fault latch */
+            if (!fault_quiesced) {
+                __atomic_store_n(&g_ch32_unbrick_pending, false, __ATOMIC_RELEASE);
+                dap_q_drain_consumer(g_dap_req_q);
+                byte_q_drain_consumer(g_swio_rx_q);
+                __atomic_store_n(&g_dap_resp_flush_pending, true, __ATOMIC_RELEASE);
+                __atomic_store_n(&g_swio_tx_flush_pending, true, __ATOMIC_RELEASE);
+                pu_dap_on_usb_disconnect();
+                pu_ch32_on_disconnect();
+                fault_quiesced = true;
+            }
             tight_loop_contents();
             continue;
         }
+        fault_quiesced = false;
 
         if (__atomic_exchange_n(&g_ch32_unbrick_pending, false, __ATOMIC_ACQ_REL)) {
             (void)pu_ch32_power_cycle_unbrick(now_us);
         }
 
-        /* Only pop a DAP request when response queue has room (zero blocking spin) */
+        /* Only pop a DAP request once Core 0 finishes any pending response flush */
         size_t req_len = 0u;
-        if (dap_q_free(g_dap_resp_q) > 0u && dap_q_pop(g_dap_req_q, dap_req, &req_len)) {
+        if (!__atomic_load_n(&g_dap_resp_flush_pending, __ATOMIC_ACQUIRE) &&
+            dap_q_free(g_dap_resp_q) > 0u &&
+            dap_q_pop(g_dap_req_q, dap_req, &req_len)) {
             size_t resp_len = pu_dap_process_packet(dap_req, req_len, dap_resp, sizeof(dap_resp), now_us);
             if (resp_len > 0u) {
                 (void)dap_q_push(g_dap_resp_q, dap_resp, resp_len);
             }
         }
 
-        size_t swio_tx_free = (kSwioRingCap - 1u) - byte_q_used(g_swio_tx_q);
-        size_t out_cap = (swio_tx_free < sizeof(swio_out)) ? swio_tx_free : sizeof(swio_out);
-        if (out_cap > 0u) {
-            size_t in_n = byte_q_pop(g_swio_rx_q, swio_in, sizeof(swio_in));
-            size_t produced = (in_n > 0u)
-                                  ? pu_ch32_gdb_feed(swio_in, in_n, swio_out, out_cap, now_us)
-                                  : pu_ch32_gdb_poll(swio_out, out_cap, now_us);
-            if (produced > 0u) {
-                (void)byte_q_push(g_swio_tx_q, swio_out, produced);
+        if (!__atomic_load_n(&g_swio_tx_flush_pending, __ATOMIC_ACQUIRE)) {
+            size_t swio_tx_free = (kSwioRingCap - 1u) - byte_q_used(g_swio_tx_q);
+            size_t out_cap = (swio_tx_free < sizeof(swio_out)) ? swio_tx_free : sizeof(swio_out);
+            if (out_cap > 0u) {
+                size_t in_n = byte_q_pop(g_swio_rx_q, swio_in, sizeof(swio_in));
+                size_t produced = (in_n > 0u)
+                                      ? pu_ch32_gdb_feed(swio_in, in_n, swio_out, out_cap, now_us)
+                                      : pu_ch32_gdb_poll(swio_out, out_cap, now_us);
+                if (produced > 0u) {
+                    (void)byte_q_push(g_swio_tx_q, swio_out, produced);
+                }
             }
         }
     }
@@ -475,12 +488,13 @@ int main(void) {
     for (;;) {
         tud_task();
         pump_usb_endpoints();
-        if (pu_ctrl_poll_deferred_bootsel()) {
-            /* Flush USB reply briefly before ROM jump if enter_bootsel returned */
+        if (pu_ctrl_is_bootsel_pending()) {
+            /* Flush USB OK status packet onto the wire BEFORE shutting down into ROM BOOTSEL */
             for (int i = 0; i < 20; ++i) {
                 tud_task();
                 busy_wait_us_32(1000u);
             }
+            (void)pu_ctrl_poll_deferred_bootsel();
         }
         uint64_t now_us = time_us_64();
         pu_engine_tick(now_us);

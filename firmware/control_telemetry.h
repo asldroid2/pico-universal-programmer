@@ -80,7 +80,8 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
                               uint8_t *resp,
                               size_t cap);
 
-/* Polled after flushing the USB status reply so ENTER_BOOTSEL shuts down cleanly */
+/* Non-consuming check + consuming trigger so caller flushes USB reply BEFORE ROM jump */
+bool pu_ctrl_is_bootsel_pending(void);
 bool pu_ctrl_poll_deferred_bootsel(void);
 
 /* Invoked by VTARG_FAULT_N falling-edge IRQ on PU_BOARD_PRO_PCB (Review Focus #5) */
