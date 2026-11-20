@@ -19,7 +19,8 @@ type WindowsDevRecord struct {
 	InstanceID       string // e.g. `USB\VID_2E8A&PID_1050\E660583883278628` or `USB\VID_2E8A&PID_1050&MI_01\7&1a2b3c4d&0&0001`
 	ParentInstanceID string // e.g. `USB\VID_2E8A&PID_1050\E660583883278628`
 	ParentPrefix     string // optional legacy WDM ParentIdPrefix (e.g. `7&1a2b3c4d&0`)
-	Product          string // bus-reported USB product string (e.g. "Pico Universal CMSIS-DAP")
+	Product          string // bus-reported USB product string (DEVPKEY_Device_BusReportedDeviceDesc)
+	DeviceDesc       string // OS registry class description (SPDRP_DEVICEDESC), kept separate from Product
 	FriendlyName     string // e.g. "USB Serial Device (COM7)"
 	PortName         string // e.g. "COM7"
 	DevicePath       string // WinUSB symbolic path if queried directly
@@ -49,11 +50,15 @@ func ParseWindowsDeviceRecords(records []WindowsDevRecord) ([]RawInterfaceNode, 
 		if tail == "" || strings.Contains(tail, "&") {
 			continue
 		}
+		parentProd := strings.TrimSpace(r.Product)
+		if parentProd == "" && !isGenericWindowsClassDesc(r.DeviceDesc) {
+			parentProd = strings.TrimSpace(r.DeviceDesc)
+		}
 		info := winParentInfo{
 			vid:     vid,
 			pid:     pid,
 			serial:  tail,
-			product: strings.TrimSpace(r.Product),
+			product: parentProd,
 		}
 		byInstance[strings.ToUpper(strings.TrimSpace(r.InstanceID))] = info
 		if pfx := strings.ToUpper(strings.TrimSpace(r.ParentPrefix)); pfx != "" {
@@ -97,10 +102,7 @@ func ParseWindowsDeviceRecords(records []WindowsDevRecord) ([]RawInterfaceNode, 
 			continue
 		}
 
-		product := strings.TrimSpace(r.Product)
-		if product == "" {
-			product = parent.product
-		}
+		product := resolveWindowsChildProduct(r.Product, r.DeviceDesc, parent.product)
 
 		devPath := resolveWindowsDevPath(r, vid, pid, mi, tail)
 		nodes = append(nodes, RawInterfaceNode{
@@ -114,6 +116,34 @@ func ParseWindowsDeviceRecords(records []WindowsDevRecord) ([]RawInterfaceNode, 
 	}
 
 	return nodes, nil
+}
+
+func isGenericWindowsClassDesc(desc string) bool {
+	trimmed := strings.TrimSpace(desc)
+	if trimmed == "" {
+		return true
+	}
+	return strings.EqualFold(trimmed, "USB Serial Device") ||
+		strings.EqualFold(trimmed, "WinUsb Device") ||
+		strings.EqualFold(trimmed, "USB Composite Device")
+}
+
+func resolveWindowsChildProduct(childBusDesc, childDevDesc, parentProduct string) string {
+	child := strings.TrimSpace(childBusDesc)
+	parent := strings.TrimSpace(parentProduct)
+	if isGenericWindowsClassDesc(child) {
+		if parent != "" {
+			return parent
+		}
+		if !isGenericWindowsClassDesc(childDevDesc) {
+			return strings.TrimSpace(childDevDesc)
+		}
+		return child
+	}
+	if strings.HasPrefix(parent, ProductPrefix) && !strings.HasPrefix(child, ProductPrefix) {
+		return parent
+	}
+	return child
 }
 
 // parseWindowsUSBInstanceID parses `USB\VID_2E8A&PID_1050\SERIAL` (mi = -1)
@@ -159,27 +189,33 @@ func parseWindowsUSBInstanceID(id string) (vid, pid uint16, mi int, tail string,
 }
 
 func resolveWindowsDevPath(r WindowsDevRecord, vid, pid uint16, mi int, tail string) string {
-	if port := strings.TrimSpace(r.PortName); port != "" {
-		return port
-	}
-	if com := extractCOMFromFriendlyName(r.FriendlyName); com != "" {
-		return com
-	}
-	if dp := strings.TrimSpace(r.DevicePath); dp != "" {
-		return dp
-	}
-	safeTail := strings.ToLower(strings.ReplaceAll(tail, `\`, "#"))
 	switch mi {
-	case 0:
-		if safeTail != "" {
+	case 0, 5:
+		if dp := strings.TrimSpace(r.DevicePath); dp != "" {
+			return dp
+		}
+		if !strings.EqualFold(strings.TrimSpace(r.Service), "WINUSB") {
+			return ""
+		}
+		safeTail := strings.ToLower(strings.ReplaceAll(tail, `\`, "#"))
+		if safeTail == "" {
+			return ""
+		}
+		if mi == 0 {
 			return fmt.Sprintf(`\\?\usb#vid_%04x&pid_%04x&mi_00#%s#%s`, vid, pid, safeTail, CMSISDAPv2WinUSBGUID)
 		}
-	case 5:
-		if safeTail != "" {
-			return fmt.Sprintf(`\\?\usb#vid_%04x&pid_%04x&mi_05#%s#%s`, vid, pid, safeTail, ControlWinUSBGUID)
+		return fmt.Sprintf(`\\?\usb#vid_%04x&pid_%04x&mi_05#%s#%s`, vid, pid, safeTail, ControlWinUSBGUID)
+	case 1, 2, 3, 4:
+		if port := strings.TrimSpace(r.PortName); isCDCSerialDevPath(port) {
+			return port
 		}
+		if com := extractCOMFromFriendlyName(r.FriendlyName); com != "" {
+			return com
+		}
+		return ""
+	default:
+		return ""
 	}
-	return strings.TrimSpace(r.InstanceID)
 }
 
 func extractCOMFromFriendlyName(friendly string) string {

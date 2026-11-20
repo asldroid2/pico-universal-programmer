@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // ErrProbeLocked is returned when another process or goroutine holds the session lock
@@ -133,4 +134,13 @@ func sanitizeSerial(serial string) (string, error) {
 		clean = clean + "-" + hex.EncodeToString(sum[:6])
 	}
 	return clean, nil
+}
+
+const windowsErrorLockViolation syscall.Errno = 33 // ERROR_LOCK_VIOLATION
+
+func mapWindowsLockFileError(lockPath string, callErr error) error {
+	if errors.Is(callErr, windowsErrorLockViolation) {
+		return fmt.Errorf("%w: %s", ErrProbeLocked, lockPath)
+	}
+	return fmt.Errorf("usbprobe: LockFileEx %s: %w", lockPath, callErr)
 }

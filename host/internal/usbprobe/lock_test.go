@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 )
 
@@ -161,5 +162,22 @@ func TestAcquireSessionLockSanitizesSerialAndHonorsEnv(t *testing.T) {
 	entries, err := os.ReadDir(envDir)
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("expected 1 sanitized lock file inside %s, got entries=%v err=%v", envDir, entries, err)
+	}
+}
+
+func TestMapWindowsLockFileErrorOnlyMapsErrno33(t *testing.T) {
+	lockedErr := mapWindowsLockFileError(`C:\locks\pu-probe-TEST.lock`, syscall.Errno(33))
+	if !errors.Is(lockedErr, ErrProbeLocked) {
+		t.Fatalf("expected syscall.Errno(33) to map to ErrProbeLocked, got %v", lockedErr)
+	}
+
+	for _, errno := range []syscall.Errno{5, 6, 32, 87} {
+		otherErr := mapWindowsLockFileError(`C:\locks\pu-probe-TEST.lock`, errno)
+		if errors.Is(otherErr, ErrProbeLocked) {
+			t.Fatalf("expected syscall.Errno(%d) NOT to map to ErrProbeLocked, got %v", errno, otherErr)
+		}
+		if !errors.Is(otherErr, errno) {
+			t.Fatalf("expected syscall.Errno(%d) to be preserved via errors.Is, got %v", errno, otherErr)
+		}
 	}
 }

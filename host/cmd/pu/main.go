@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,11 +17,52 @@ import (
 
 var version = "0.1.0"
 
+type commandSpec struct {
+	Name string
+	Args []string
+	Env  []string
+}
+
+type commandRunner interface {
+	LookPath(file string) (string, error)
+	Run(cmd commandSpec, stdout, stderr io.Writer) error
+}
+
+type osCommandRunner struct{}
+
+func (osCommandRunner) LookPath(file string) (string, error) {
+	return exec.LookPath(file)
+}
+
+func (osCommandRunner) Run(spec commandSpec, stdout, stderr io.Writer) error {
+	c := exec.Command(spec.Name, spec.Args...)
+	if len(spec.Env) > 0 {
+		c.Env = append(os.Environ(), spec.Env...)
+	}
+	c.Stdout = stdout
+	c.Stderr = stderr
+	return c.Run()
+}
+
+type cliEnv struct {
+	stdout         io.Writer
+	stderr         io.Writer
+	getenv         func(string) string
+	geteuid        func() int
+	goos           string
+	cmdRunner      commandRunner
+	discoverProbes func(vid, pid uint16) ([]usbprobe.ProbeDevice, error)
+}
+
 type cliContext struct {
-	stdout    io.Writer
-	stderr    io.Writer
-	getenv    func(string) string
-	globalPID string
+	stdout         io.Writer
+	stderr         io.Writer
+	getenv         func(string) string
+	geteuid        func() int
+	goos           string
+	cmdRunner      commandRunner
+	discoverProbes func(vid, pid uint16) ([]usbprobe.ProbeDevice, error)
+	globalPID      string
 }
 
 type subcommandFunc func(ctx cliContext, args []string) int
@@ -49,8 +91,43 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
+	return runWithEnv(args, cliEnv{
+		stdout: stdout,
+		stderr: stderr,
+		getenv: getenv,
+	})
+}
+
+func runWithEnv(args []string, env cliEnv) int {
+	stdout := env.stdout
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	stderr := env.stderr
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	getenv := env.getenv
 	if getenv == nil {
 		getenv = os.Getenv
+	}
+	geteuid := env.geteuid
+	if geteuid == nil {
+		geteuid = os.Geteuid
+	}
+	goos := env.goos
+	if goos == "" {
+		goos = runtime.GOOS
+	}
+	cmdRunner := env.cmdRunner
+	if cmdRunner == nil {
+		cmdRunner = osCommandRunner{}
+	}
+	discoverProbes := env.discoverProbes
+	if discoverProbes == nil {
+		discoverProbes = func(vid, pid uint16) ([]usbprobe.ProbeDevice, error) {
+			return usbprobe.DiscoverProbesWithID("", vid, pid)
+		}
 	}
 
 	fs := flag.NewFlagSet("pu", flag.ContinueOnError)
@@ -69,7 +146,7 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 	}
 
 	if *verFlag {
-		fmt.Fprintf(stdout, "pu version %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(stdout, "pu version %s (%s/%s)\n", version, goos, runtime.GOARCH)
 		return 0
 	}
 
@@ -80,10 +157,14 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 	}
 
 	ctx := cliContext{
-		stdout:    stdout,
-		stderr:    stderr,
-		getenv:    getenv,
-		globalPID: *pidFlag,
+		stdout:         stdout,
+		stderr:         stderr,
+		getenv:         getenv,
+		geteuid:        geteuid,
+		goos:           goos,
+		cmdRunner:      cmdRunner,
+		discoverProbes: discoverProbes,
+		globalPID:      *pidFlag,
 	}
 
 	sub := rest[0]
@@ -91,7 +172,7 @@ func run(args []string, stdout, stderr io.Writer, getenv func(string) string) in
 
 	switch sub {
 	case "version":
-		fmt.Fprintf(stdout, "pu version %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(stdout, "pu version %s (%s/%s)\n", version, goos, runtime.GOARCH)
 		return 0
 	case "help", "-h", "--help":
 		printUsage(stdout)
@@ -191,7 +272,7 @@ func runList(ctx cliContext, args []string) int {
 		return 2
 	}
 
-	probes, err := usbprobe.DiscoverProbes(*serialFlag, vid, pid)
+	probes, err := usbprobe.DiscoverProbesWithID(*serialFlag, vid, pid)
 	if err != nil {
 		fmt.Fprintf(ctx.stderr, "pu list: discovery failed: %v\n", err)
 		return 1

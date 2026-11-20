@@ -103,15 +103,11 @@ func collectOSInterfaceNodes(vid, _ uint16) ([]RawInterfaceNode, error) {
 			parentInstID = cmGetDeviceID(parentDevInst)
 		}
 
-		product := queryBusReportedDesc(hDevInfo, &devInfo)
-		if product == "" {
-			product = queryDeviceRegString(hDevInfo, &devInfo, spdrpDeviceDesc)
-		}
-
 		records = append(records, WindowsDevRecord{
 			InstanceID:       instanceID,
 			ParentInstanceID: parentInstID,
-			Product:          product,
+			Product:          queryBusReportedDesc(hDevInfo, &devInfo),
+			DeviceDesc:       queryDeviceRegString(hDevInfo, &devInfo, spdrpDeviceDesc),
 			FriendlyName:     queryDeviceRegString(hDevInfo, &devInfo, spdrpFriendlyName),
 			Service:          queryDeviceRegString(hDevInfo, &devInfo, spdrpService),
 			PortName:         queryDevRegPortName(hDevInfo, &devInfo),

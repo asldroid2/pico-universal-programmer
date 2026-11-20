@@ -58,7 +58,7 @@ func lockOSFile(lockPath string) (io.Closer, error) {
 	)
 	if r1 == 0 {
 		_ = f.Close()
-		return nil, fmt.Errorf("%w (%s): %v", ErrProbeLocked, lockPath, callErr)
+		return nil, mapWindowsLockFileError(lockPath, callErr)
 	}
 	return &windowsFileLock{f: f}, nil
 }

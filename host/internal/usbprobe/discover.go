@@ -1,7 +1,11 @@
 package usbprobe
 
 import (
+	"errors"
+	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -88,15 +92,19 @@ func CorrelateNodes(nodes []RawInterfaceNode, vid, pid uint16) []ProbeDevice {
 				p.Product = prod
 			}
 		case 1:
-			p.GDBPort = n.DevPath
+			if isCDCSerialDevPath(n.DevPath) {
+				p.GDBPort = n.DevPath
+			}
 		case 2:
-			if p.GDBPort == "" {
+			if p.GDBPort == "" && isCDCSerialDevPath(n.DevPath) {
 				p.GDBPort = n.DevPath
 			}
 		case 3:
-			p.UARTPort = n.DevPath
+			if isCDCSerialDevPath(n.DevPath) {
+				p.UARTPort = n.DevPath
+			}
 		case 4:
-			if p.UARTPort == "" {
+			if p.UARTPort == "" && isCDCSerialDevPath(n.DevPath) {
 				p.UARTPort = n.DevPath
 			}
 		case 5:
@@ -124,9 +132,61 @@ func CorrelateNodes(nodes []RawInterfaceNode, vid, pid uint16) []ProbeDevice {
 	return out
 }
 
-// DiscoverProbes enumerates composite Pico Universal probes on the current OS,
+func isCDCSerialDevPath(devPath string) bool {
+	p := strings.TrimSpace(devPath)
+	if p == "" {
+		return false
+	}
+	if strings.HasPrefix(p, "/dev/tty") {
+		return true
+	}
+	upper := strings.ToUpper(p)
+	upper = strings.TrimPrefix(upper, `\\.\`)
+	if strings.HasPrefix(upper, "COM") && len(upper) > 3 {
+		for i := 3; i < len(upper); i++ {
+			if upper[i] < '0' || upper[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+func resolveDefaultPIDFromEnv() (uint16, error) {
+	raw := strings.TrimSpace(os.Getenv("PU_USB_PID"))
+	if raw == "" {
+		return DefaultPID, nil
+	}
+	s := raw
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = s[2:]
+	}
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "u"), "U")
+	if len(s) == 0 || len(s) > 4 {
+		return 0, errors.New("usbprobe: invalid PU_USB_PID value")
+	}
+	v, err := strconv.ParseUint(s, 16, 16)
+	if err != nil {
+		return 0, fmt.Errorf("usbprobe: invalid PU_USB_PID %q: %w", raw, err)
+	}
+	return uint16(v), nil
+}
+
+// DiscoverProbes enumerates composite Pico Universal probes on the current OS using
+// DefaultVID (0x2E8A) and PU_USB_PID from the environment (or 0x0000 wildcard when unset),
 // optionally filtering by hardware serial number (case-insensitive).
-func DiscoverProbes(filterSerial string, vid, pid uint16) ([]ProbeDevice, error) {
+func DiscoverProbes(filterSerial string) ([]ProbeDevice, error) {
+	pid, err := resolveDefaultPIDFromEnv()
+	if err != nil {
+		return nil, err
+	}
+	return DiscoverProbesWithID(filterSerial, DefaultVID, pid)
+}
+
+// DiscoverProbesWithID enumerates composite Pico Universal probes on the current OS
+// for an explicit VID/PID pair, optionally filtering by hardware serial number (case-insensitive).
+func DiscoverProbesWithID(filterSerial string, vid, pid uint16) ([]ProbeDevice, error) {
 	effectiveVID := vid
 	if effectiveVID == 0 {
 		effectiveVID = DefaultVID

@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,54 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 )
+
+//go:embed embedded/targets.json
+var embeddedTargetsJSON []byte
+
+//go:embed embedded/dependencies.lock.json
+var embeddedDependenciesLockJSON []byte
+
+//go:embed embedded/openocd/pu-esp32.cfg
+var embeddedESP32OpenOCDConfig []byte
+
+// EmbeddedTargetsJSON returns a defensive copy of the embedded catalog/targets.json bytes.
+func EmbeddedTargetsJSON() []byte {
+	return append([]byte(nil), embeddedTargetsJSON...)
+}
+
+// EmbeddedDependenciesLockJSON returns a defensive copy of the embedded catalog/dependencies.lock.json bytes.
+func EmbeddedDependenciesLockJSON() []byte {
+	return append([]byte(nil), embeddedDependenciesLockJSON...)
+}
+
+// EmbeddedESP32OpenOCDConfig returns a defensive copy of the embedded catalog/openocd/pu-esp32.cfg bytes.
+func EmbeddedESP32OpenOCDConfig() []byte {
+	return append([]byte(nil), embeddedESP32OpenOCDConfig...)
+}
+
+// LoadESP32OpenOCDConfig loads pu-esp32.cfg from catalogDir/openocd/pu-esp32.cfg when
+// catalogDir is explicitly specified and contains that file, otherwise returning the
+// embedded pu-esp32.cfg bytes.
+func LoadESP32OpenOCDConfig(catalogDir string) ([]byte, error) {
+	if strings.TrimSpace(catalogDir) != "" {
+		catDir, err := ResolveCatalogDir(catalogDir)
+		if err != nil {
+			return nil, err
+		}
+		candidate := filepath.Join(catDir, "openocd", "pu-esp32.cfg")
+		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
+			raw, readErr := os.ReadFile(candidate)
+			if readErr != nil {
+				return nil, fmt.Errorf("catalog: read %s: %w", candidate, readErr)
+			}
+			return raw, nil
+		}
+	}
+	return EmbeddedESP32OpenOCDConfig(), nil
+}
 
 // CoreSpec describes a pinned Arduino core in catalog/targets.json.
 type CoreSpec struct {
@@ -263,9 +311,20 @@ func ResolveCatalogDir(path string) (string, error) {
 	return "", errors.New("catalog: targets.json not found in default search paths; pass --catalog-dir")
 }
 
+// LoadDefault parses and validates the embedded targets.json and dependencies.lock.json
+// assets so standalone binaries work from any working directory without external files.
+func LoadDefault() (*TargetsCatalog, *DependenciesLock, error) {
+	return parseAndValidate(embeddedTargetsJSON, embeddedDependenciesLockJSON, "embedded:targets.json", "embedded:dependencies.lock.json")
+}
+
 // Load parses and validates targets.json and dependencies.lock.json from path
-// (accepting either the catalog directory or repository root).
+// (accepting either the catalog directory or repository root). When path is empty,
+// Load delegates to LoadDefault() using the embedded catalog assets.
 func Load(path string) (*TargetsCatalog, *DependenciesLock, error) {
+	if strings.TrimSpace(path) == "" {
+		return LoadDefault()
+	}
+
 	catDir, err := ResolveCatalogDir(path)
 	if err != nil {
 		return nil, nil, err
@@ -283,9 +342,13 @@ func Load(path string) (*TargetsCatalog, *DependenciesLock, error) {
 		return nil, nil, fmt.Errorf("catalog: read %s: %w", lockPath, err)
 	}
 
+	return parseAndValidate(targetsRaw, lockRaw, targetsPath, lockPath)
+}
+
+func parseAndValidate(targetsRaw, lockRaw []byte, targetsLabel, lockLabel string) (*TargetsCatalog, *DependenciesLock, error) {
 	var tc TargetsCatalog
 	if err := json.Unmarshal(targetsRaw, &tc); err != nil {
-		return nil, nil, fmt.Errorf("catalog: parse %s: %w", targetsPath, err)
+		return nil, nil, fmt.Errorf("catalog: parse %s: %w", targetsLabel, err)
 	}
 	if tc.SchemaVersion != 1 {
 		return nil, nil, fmt.Errorf("catalog: unsupported targets.json schema_version %d", tc.SchemaVersion)
@@ -293,7 +356,7 @@ func Load(path string) (*TargetsCatalog, *DependenciesLock, error) {
 
 	var lock DependenciesLock
 	if err := json.Unmarshal(lockRaw, &lock); err != nil {
-		return nil, nil, fmt.Errorf("catalog: parse %s: %w", lockPath, err)
+		return nil, nil, fmt.Errorf("catalog: parse %s: %w", lockLabel, err)
 	}
 	if lock.SchemaVersion != 1 {
 		return nil, nil, fmt.Errorf("catalog: unsupported dependencies.lock.json schema_version %d", lock.SchemaVersion)
@@ -312,6 +375,9 @@ func Load(path string) (*TargetsCatalog, *DependenciesLock, error) {
 		return nil, nil, err
 	}
 	if err := validateLock(&lock); err != nil {
+		return nil, nil, err
+	}
+	if err := validateCatalogAgainstLock(&tc, &lock); err != nil {
 		return nil, nil, err
 	}
 	return &tc, &lock, nil
@@ -341,8 +407,45 @@ func validateCatalog(tc *TargetsCatalog) error {
 	return nil
 }
 
+func isSafeLockFilename(fn string) bool {
+	if fn == "" || fn == "." || fn == ".." {
+		return false
+	}
+	if strings.TrimSpace(fn) != fn {
+		return false
+	}
+	if strings.Contains(fn, "..") || strings.ContainsAny(fn, `/\`) {
+		return false
+	}
+	return true
+}
+
+func validateCatalogAgainstLock(tc *TargetsCatalog, lock *DependenciesLock) error {
+	coreKeys := make([]string, 0, len(tc.Cores))
+	for k := range tc.Cores {
+		coreKeys = append(coreKeys, k)
+	}
+	sort.Strings(coreKeys)
+
+	for _, key := range coreKeys {
+		targetCore := tc.Cores[key]
+		lockedCore, ok := lock.Cores[key]
+		if !ok {
+			return fmt.Errorf("catalog: core %q in targets.json is missing from dependencies.lock.json", key)
+		}
+		if lockedCore.Package != targetCore.Package || lockedCore.Version != targetCore.Version {
+			return fmt.Errorf("catalog: core %q lock mismatch: targets.json has %s@%s, lockfile has %s@%s",
+				key, targetCore.Package, targetCore.Version, lockedCore.Package, lockedCore.Version)
+		}
+	}
+	return nil
+}
+
 func validateLock(lock *DependenciesLock) error {
-	for _, idx := range lock.Indexes {
+	for i, idx := range lock.Indexes {
+		if !isSafeLockFilename(idx.Filename) {
+			return fmt.Errorf("catalog: unsafe or empty filename %q for index #%d", idx.Filename, i)
+		}
 		if !IsValidSHA256Hex(idx.SHA256) {
 			return fmt.Errorf("catalog: invalid sha256 %q for index %q", idx.SHA256, idx.Filename)
 		}
@@ -353,13 +456,28 @@ func validateLock(lock *DependenciesLock) error {
 	if len(lock.Artifacts) == 0 {
 		return errors.New("catalog: dependencies.lock.json contains no artifacts")
 	}
-	for id, art := range lock.Artifacts {
+	artKeys := make([]string, 0, len(lock.Artifacts))
+	for id := range lock.Artifacts {
+		artKeys = append(artKeys, id)
+	}
+	sort.Strings(artKeys)
+
+	seenFilenameDigest := make(map[string]string, len(artKeys))
+	for _, id := range artKeys {
+		art := lock.Artifacts[id]
+		if !isSafeLockFilename(art.Filename) {
+			return fmt.Errorf("catalog: unsafe or empty filename %q for artifact %q", art.Filename, id)
+		}
 		if !IsValidSHA256Hex(art.SHA256) {
 			return fmt.Errorf("catalog: invalid sha256 %q for artifact %q", art.SHA256, id)
 		}
 		if art.Size <= 0 {
 			return fmt.Errorf("catalog: non-positive size %d for artifact %q", art.Size, id)
 		}
+		if prevSHA, exists := seenFilenameDigest[art.Filename]; exists && prevSHA != art.SHA256 {
+			return fmt.Errorf("catalog: conflicting sha256 digests for artifact filename %q", art.Filename)
+		}
+		seenFilenameDigest[art.Filename] = art.SHA256
 	}
 	requireArtifact := func(ref, owner string) error {
 		if _, ok := lock.Artifacts[ref]; !ok {

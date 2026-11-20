@@ -183,3 +183,131 @@ func TestVerifyFileSHA256(t *testing.T) {
 		t.Fatal("expected missing file to fail")
 	}
 }
+
+func TestEmbeddedCatalogAssetsMatchRepoFilesByteForByte(t *testing.T) {
+	root := repoRoot(t)
+
+	checks := []struct {
+		relPath  string
+		embedded []byte
+	}{
+		{filepath.Join("catalog", "targets.json"), EmbeddedTargetsJSON()},
+		{filepath.Join("catalog", "dependencies.lock.json"), EmbeddedDependenciesLockJSON()},
+		{filepath.Join("catalog", "openocd", "pu-esp32.cfg"), EmbeddedESP32OpenOCDConfig()},
+	}
+
+	for _, c := range checks {
+		want, err := os.ReadFile(filepath.Join(root, c.relPath))
+		if err != nil {
+			t.Fatalf("read %s: %v", c.relPath, err)
+		}
+		if string(c.embedded) != string(want) {
+			t.Fatalf("embedded asset drifted from repo %s (embedded=%d bytes, repo=%d bytes)", c.relPath, len(c.embedded), len(want))
+		}
+	}
+}
+
+func TestLoadDefaultWorksFromIsolatedWorkingDirectory(t *testing.T) {
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	isolated := t.TempDir()
+	if err := os.Chdir(isolated); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+
+	tc, lock, err := LoadDefault()
+	if err != nil {
+		t.Fatalf("LoadDefault() failed in isolated cwd: %v", err)
+	}
+	if len(tc.Cores) != 4 || len(tc.Profiles) != 7 || len(lock.Artifacts) == 0 {
+		t.Fatalf("unexpected embedded catalog contents: cores=%d profiles=%d artifacts=%d", len(tc.Cores), len(tc.Profiles), len(lock.Artifacts))
+	}
+
+	tc2, lock2, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\") failed in isolated cwd: %v", err)
+	}
+	if lock2.CatalogSHA256 != lock.CatalogSHA256 || len(tc2.Boards) != len(tc.Boards) {
+		t.Fatal("Load(\"\") did not match LoadDefault()")
+	}
+}
+
+func TestValidateLockRejectsEmptyOrPathTraversalFilenames(t *testing.T) {
+	badFilenames := []struct {
+		name string
+		orig string
+		bad  string
+	}{
+		{"empty_artifact_filename", `"filename": "STM32-2.12.0.tar.bz2"`, `"filename": ""`},
+		{"dotdot_artifact_filename", `"filename": "STM32-2.12.0.tar.bz2"`, `"filename": "../STM32-2.12.0.tar.bz2"`},
+		{"slash_artifact_filename", `"filename": "STM32-2.12.0.tar.bz2"`, `"filename": "sub/STM32-2.12.0.tar.bz2"`},
+		{"backslash_artifact_filename", `"filename": "STM32-2.12.0.tar.bz2"`, `"filename": "sub\\STM32-2.12.0.tar.bz2"`},
+		{"empty_index_filename", `"filename": "package_index.json"`, `"filename": ""`},
+		{"traversal_index_filename", `"filename": "package_index.json"`, `"filename": "../package_index.json"`},
+	}
+
+	for _, tc := range badFilenames {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := copyCatalogFixture(t)
+			lockPath := filepath.Join(dir, "dependencies.lock.json")
+			raw, err := os.ReadFile(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutated := strings.Replace(string(raw), tc.orig, tc.bad, 1)
+			if mutated == string(raw) {
+				t.Fatalf("failed to mutate fixture for %s", tc.name)
+			}
+			if err := os.WriteFile(lockPath, []byte(mutated), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := Load(dir); err == nil {
+				t.Fatalf("expected Load to reject %s, got nil", tc.name)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsTargetsCoreMissingFromLockfile(t *testing.T) {
+	dir := copyCatalogFixture(t)
+	lockPath := filepath.Join(dir, "dependencies.lock.json")
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutated := strings.Replace(string(raw), `"ch32v": {`, `"unlisted_core": {`, 1)
+	if mutated == string(raw) {
+		t.Fatal("failed to mutate ch32v core key in lockfile")
+	}
+	if err := os.WriteFile(lockPath, []byte(mutated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "ch32v") {
+		t.Fatalf("expected missing lock core error mentioning ch32v, got %v", err)
+	}
+}
+
+func TestValidateLockRejectsConflictingDigestsForSameFilename(t *testing.T) {
+	dir := copyCatalogFixture(t)
+	lockPath := filepath.Join(dir, "dependencies.lock.json")
+	raw, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CMSIS-6.2.0.tar.bz2 appears twice (linux-x86_64 and windows-x86_64); mutate only the first SHA-256.
+	mutated := strings.Replace(string(raw),
+		"e9dcf458a333cda8d4332bb3a4058e8c3de1626c4a567250c60151b590a1d8ce",
+		"1111111111111111111111111111111111111111111111111111111111111111", 1)
+	if mutated == string(raw) {
+		t.Fatal("failed to mutate first CMSIS digest")
+	}
+	if err := os.WriteFile(lockPath, []byte(mutated), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "CMSIS-6.2.0.tar.bz2") {
+		t.Fatalf("expected conflicting filename digest error, got %v", err)
+	}
+}

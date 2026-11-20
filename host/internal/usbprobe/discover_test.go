@@ -250,12 +250,314 @@ func TestParseWindowsDeviceRecordsMultiProbeCorrelation(t *testing.T) {
 }
 
 func TestDiscoverProbesRunsCleanlyOnHost(t *testing.T) {
-	// Must never error even on CI runners with zero probes attached.
-	probes, err := DiscoverProbes("NONEXISTENT_SERIAL_FILTER", 0x2E8A, 0x0000)
+	t.Setenv("PU_USB_PID", "")
+	probes, err := DiscoverProbes("NONEXISTENT_SERIAL_FILTER")
 	if err != nil {
 		t.Fatalf("DiscoverProbes returned unexpected error: %v", err)
 	}
 	if len(probes) != 0 {
 		t.Fatalf("expected 0 probes for nonexistent serial filter, got %+v", probes)
+	}
+
+	t.Setenv("PU_USB_PID", "0x1050")
+	probes, err = DiscoverProbes("NONEXISTENT_SERIAL_FILTER")
+	if err != nil {
+		t.Fatalf("DiscoverProbes with PU_USB_PID=0x1050 returned unexpected error: %v", err)
+	}
+	if len(probes) != 0 {
+		t.Fatalf("expected 0 probes for nonexistent serial filter, got %+v", probes)
+	}
+
+	t.Setenv("PU_USB_PID", "0xZZZZ")
+	if _, err := DiscoverProbes("NONEXISTENT_SERIAL_FILTER"); err == nil {
+		t.Fatal("expected DiscoverProbes to fail on invalid PU_USB_PID")
+	}
+
+	probes, err = DiscoverProbesWithID("NONEXISTENT_SERIAL_FILTER", 0x2E8A, 0x0000)
+	if err != nil {
+		t.Fatalf("DiscoverProbesWithID returned unexpected error: %v", err)
+	}
+	if len(probes) != 0 {
+		t.Fatalf("expected 0 probes for nonexistent serial filter, got %+v", probes)
+	}
+}
+
+func TestWindowsWildcardPIDZeroWithGenericChildProductFallback(t *testing.T) {
+	records := []WindowsDevRecord{
+		{
+			InstanceID: `USB\VID_2E8A&PID_1050\E660583883111111`,
+			Product:    "Pico Universal CMSIS-DAP",
+			DeviceDesc: "USB Composite Device",
+			Service:    "usbccgp",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_00\6&11223344&0&0000`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883111111`,
+			Product:          "WinUsb Device",
+			DeviceDesc:       "WinUsb Device",
+			Service:          "WINUSB",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_01\6&11223344&0&0001`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883111111`,
+			Product:          "USB Serial Device",
+			DeviceDesc:       "USB Serial Device",
+			PortName:         "COM7",
+			Service:          "usbser",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_03\6&11223344&0&0003`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883111111`,
+			Product:          "USB Serial Device",
+			DeviceDesc:       "USB Serial Device",
+			PortName:         "COM8",
+			Service:          "usbser",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_05\6&11223344&0&0005`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883111111`,
+			Product:          "",
+			DeviceDesc:       "WinUsb Device",
+			Service:          "WINUSB",
+		},
+	}
+
+	nodes, err := ParseWindowsDeviceRecords(records)
+	if err != nil {
+		t.Fatalf("ParseWindowsDeviceRecords error: %v", err)
+	}
+	probes := CorrelateNodes(nodes, 0x2E8A, 0x0000)
+	if len(probes) != 1 {
+		t.Fatalf("expected 1 wildcard Windows probe when child Product is generic OS fallback, got %d: %+v", len(probes), probes)
+	}
+	p := probes[0]
+	if p.Serial != "E660583883111111" || p.Product != "Pico Universal CMSIS-DAP" || p.GDBPort != "COM7" || p.UARTPort != "COM8" {
+		t.Fatalf("unexpected correlated Windows probe: %+v", p)
+	}
+	if p.DAPPath == "" || p.CtrlPath == "" {
+		t.Fatalf("expected WinUSB DAPPath and CtrlPath, got %+v", p)
+	}
+}
+
+func TestLinuxSysfsUnboundCDCAndIF2IF4Fallback(t *testing.T) {
+	busDevs := filepath.Join(t.TempDir(), "sys", "bus", "usb", "devices")
+	if err := os.MkdirAll(busDevs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Probe A: IF 1 unbound, IF 2 bound to ttyACM0; IF 3 & IF 4 both unbound.
+	devA := filepath.Join(busDevs, "1-1")
+	writeSysfsFile(t, filepath.Join(devA, "idVendor"), "2e8a\n")
+	writeSysfsFile(t, filepath.Join(devA, "idProduct"), "1050\n")
+	writeSysfsFile(t, filepath.Join(devA, "serial"), "E660583883000001\n")
+	writeSysfsFile(t, filepath.Join(devA, "product"), "Pico Universal CMSIS-DAP\n")
+	writeSysfsFile(t, filepath.Join(devA, "busnum"), "1\n")
+	writeSysfsFile(t, filepath.Join(devA, "devnum"), "4\n")
+	for _, itf := range []struct {
+		num string
+		hex string
+		tty string
+	}{
+		{"0", "00", ""},
+		{"1", "01", ""},
+		{"2", "02", "ttyACM0"},
+		{"3", "03", ""},
+		{"4", "04", ""},
+		{"5", "05", ""},
+	} {
+		ifDir := filepath.Join(devA, "1-1:1."+itf.num)
+		writeSysfsFile(t, filepath.Join(ifDir, "bInterfaceNumber"), itf.hex+"\n")
+		if itf.tty != "" {
+			if err := os.MkdirAll(filepath.Join(ifDir, "tty", itf.tty), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	// Probe B: IF 1 & IF 2 unbound; IF 3 unbound, IF 4 bound to ttyUSB1.
+	devB := filepath.Join(busDevs, "1-2")
+	writeSysfsFile(t, filepath.Join(devB, "idVendor"), "2e8a\n")
+	writeSysfsFile(t, filepath.Join(devB, "idProduct"), "1050\n")
+	writeSysfsFile(t, filepath.Join(devB, "serial"), "E660583883000002\n")
+	writeSysfsFile(t, filepath.Join(devB, "product"), "Pico Universal CMSIS-DAP\n")
+	writeSysfsFile(t, filepath.Join(devB, "busnum"), "1\n")
+	writeSysfsFile(t, filepath.Join(devB, "devnum"), "5\n")
+	for _, itf := range []struct {
+		num string
+		hex string
+		tty string
+	}{
+		{"0", "00", ""},
+		{"1", "01", ""},
+		{"2", "02", ""},
+		{"3", "03", ""},
+		{"4", "04", "ttyUSB1"},
+		{"5", "05", ""},
+	} {
+		ifDir := filepath.Join(devB, "1-2:1."+itf.num)
+		writeSysfsFile(t, filepath.Join(ifDir, "bInterfaceNumber"), itf.hex+"\n")
+		if itf.tty != "" {
+			if err := os.MkdirAll(filepath.Join(ifDir, "tty", itf.tty), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	nodes, err := ParseLinuxSysfsTree(busDevs)
+	if err != nil {
+		t.Fatalf("ParseLinuxSysfsTree error: %v", err)
+	}
+	probes := CorrelateNodes(nodes, 0x2E8A, 0x0000)
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d: %+v", len(probes), probes)
+	}
+
+	if probes[0].DAPPath != "/dev/bus/usb/001/004" || probes[0].CtrlPath != "/dev/bus/usb/001/004" {
+		t.Fatalf("expected bulk /dev/bus/usb fallback on IF 0/5 for probe[0], got %+v", probes[0])
+	}
+	if probes[0].GDBPort != "/dev/ttyACM0" || probes[0].UARTPort != "" {
+		t.Fatalf("expected IF 2 ttyACM0 fallback and empty unbound UARTPort on probe[0], got %+v", probes[0])
+	}
+	if probes[1].GDBPort != "" || probes[1].UARTPort != "/dev/ttyUSB1" {
+		t.Fatalf("expected empty unbound GDBPort and IF 4 ttyUSB1 fallback on probe[1], got %+v", probes[1])
+	}
+}
+
+func TestWindowsUnboundCDCAndIF2IF4Fallback(t *testing.T) {
+	records := []WindowsDevRecord{
+		// Probe A: MI_01 unbound, MI_02 = COM15; MI_03 & MI_04 unbound
+		{
+			InstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+			Product:    "Pico Universal CMSIS-DAP",
+			Service:    "usbccgp",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_00\6&aaaa&0&0000`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+			Service:          "WINUSB",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_01\6&aaaa&0&0001`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+			FriendlyName:     "Pico Universal CDC Control",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_02\6&aaaa&0&0002`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+			PortName:         "COM15",
+			Service:          "usbser",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_03\6&aaaa&0&0003`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_04\6&aaaa&0&0004`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_05\6&aaaa&0&0005`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA01`,
+			Service:          "WINUSB",
+		},
+
+		// Probe B: MI_01 & MI_02 unbound; MI_03 unbound, MI_04 = COM16 via FriendlyName
+		{
+			InstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA02`,
+			Product:    "Pico Universal CMSIS-DAP",
+			Service:    "usbccgp",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_01\6&bbbb&0&0001`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA02`,
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_02\6&bbbb&0&0002`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA02`,
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_03\6&bbbb&0&0003`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA02`,
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_04\6&bbbb&0&0004`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883AAAA02`,
+			FriendlyName:     "USB Serial Device (COM16)",
+			Service:          "usbser",
+		},
+	}
+
+	nodes, err := ParseWindowsDeviceRecords(records)
+	if err != nil {
+		t.Fatalf("ParseWindowsDeviceRecords error: %v", err)
+	}
+	probes := CorrelateNodes(nodes, 0x2E8A, 0x0000)
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d: %+v", len(probes), probes)
+	}
+	if probes[0].GDBPort != "COM15" || probes[0].UARTPort != "" {
+		t.Fatalf("expected MI_02 COM15 fallback and empty unbound UARTPort on probe[0], got %+v", probes[0])
+	}
+	if probes[1].GDBPort != "" || probes[1].UARTPort != "COM16" {
+		t.Fatalf("expected empty unbound GDBPort and MI_04 COM16 fallback on probe[1], got %+v", probes[1])
+	}
+}
+
+func TestWindowsNonWinUSBServiceRejectedOnBulkInterfaces(t *testing.T) {
+	records := []WindowsDevRecord{
+		{
+			InstanceID: `USB\VID_2E8A&PID_1050\E660583883NONWIN`,
+			Product:    "Pico Universal CMSIS-DAP",
+			Service:    "usbccgp",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_00\6&cccc&0&0000`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883NONWIN`,
+			Service:          "libusbK",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_01\6&cccc&0&0001`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883NONWIN`,
+			PortName:         "COM7",
+			Service:          "usbser",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_05\6&cccc&0&0005`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883NONWIN`,
+			Service:          "",
+		},
+
+		// Second probe: case-insensitive "WinUsb" on MI_00 and explicit DevicePath on MI_05
+		{
+			InstanceID: `USB\VID_2E8A&PID_1050\E660583883WINOK1`,
+			Product:    "Pico Universal CMSIS-DAP",
+			Service:    "usbccgp",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_00\6&dddd&0&0000`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883WINOK1`,
+			Service:          "WinUsb",
+		},
+		{
+			InstanceID:       `USB\VID_2E8A&PID_1050&MI_05\6&dddd&0&0005`,
+			ParentInstanceID: `USB\VID_2E8A&PID_1050\E660583883WINOK1`,
+			DevicePath:       `\\?\usb#vid_2e8a&pid_1050&mi_05#explicit#{50554354-2e8a-4d53-9a05-1aae46463777}`,
+			Service:          "",
+		},
+	}
+
+	nodes, err := ParseWindowsDeviceRecords(records)
+	if err != nil {
+		t.Fatalf("ParseWindowsDeviceRecords error: %v", err)
+	}
+	probes := CorrelateNodes(nodes, 0x2E8A, 0x0000)
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d: %+v", len(probes), probes)
+	}
+	if probes[0].DAPPath != "" || probes[0].CtrlPath != "" {
+		t.Fatalf("expected non-WinUSB MI_00/MI_05 to leave DAPPath and CtrlPath empty, got %+v", probes[0])
+	}
+	if probes[1].DAPPath == "" || probes[1].CtrlPath != `\\?\usb#vid_2e8a&pid_1050&mi_05#explicit#{50554354-2e8a-4d53-9a05-1aae46463777}` {
+		t.Fatalf("expected WinUsb MI_00 and explicit DevicePath MI_05 to succeed, got %+v", probes[1])
 	}
 }

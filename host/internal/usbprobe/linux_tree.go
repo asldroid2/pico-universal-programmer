@@ -85,13 +85,16 @@ func ParseLinuxSysfsTree(sysfsRoot string) ([]RawInterfaceNode, error) {
 				continue
 			}
 
-			devPath := findSysfsTTYDevPath(ifDir)
-			if devPath == "" {
+			var devPath string
+			switch ifNum {
+			case 0, 5:
 				if hasBus && hasDev {
 					devPath = fmt.Sprintf("/dev/bus/usb/%03d/%03d", busNum, devNum)
 				} else {
 					devPath = ifDir
 				}
+			case 1, 2, 3, 4:
+				devPath = findSysfsTTYDevPath(ifDir)
 			}
 
 			ifProduct := product
@@ -168,11 +171,15 @@ func parseSysfsInterfaceNumber(ifDir, ifName string) (int, bool) {
 }
 
 func findSysfsTTYDevPath(ifDir string) string {
-	// Standard modern Linux cdc_acm layout: <ifDir>/tty/ttyACM0
+	isCDCTTYName := func(name string) bool {
+		return strings.HasPrefix(name, "ttyACM") || strings.HasPrefix(name, "ttyUSB")
+	}
+
+	// Standard modern Linux cdc_acm / usbserial layout: <ifDir>/tty/ttyACM0 or ttyUSB0
 	if ttyEntries, err := os.ReadDir(filepath.Join(ifDir, "tty")); err == nil {
 		var names []string
 		for _, e := range ttyEntries {
-			if strings.HasPrefix(e.Name(), "tty") {
+			if isCDCTTYName(e.Name()) {
 				names = append(names, e.Name())
 			}
 		}
@@ -182,11 +189,11 @@ func findSysfsTTYDevPath(ifDir string) string {
 		}
 	}
 
-	// Legacy layout: <ifDir>/ttyACM0
+	// Legacy layout: <ifDir>/ttyACM0 or ttyUSB0
 	if entries, err := os.ReadDir(ifDir); err == nil {
 		var names []string
 		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "tty") && e.Name() != "tty" {
+			if isCDCTTYName(e.Name()) {
 				names = append(names, e.Name())
 			}
 		}
