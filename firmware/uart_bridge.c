@@ -19,6 +19,7 @@
 #endif
 #include "firmware/tusb_config.h"
 #include "firmware/usb_descriptors.h"
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/uart.h"
@@ -44,7 +45,7 @@ typedef struct {
 
 static pu_uart_ring_t s_rx_ring;
 static pu_uart_ring_t s_tx_ring;
-static volatile uint32_t s_rx_drops = 0u;
+static uint32_t s_rx_drops = 0u;
 static pu_uart_line_coding_t s_coding = {
     .baud = PU_UART_DEFAULT_BAUD,
     .data_bits = 8u,
@@ -54,11 +55,24 @@ static pu_uart_line_coding_t s_coding = {
 static pu_uart_hw_hal_t s_hw_hal;
 
 static size_t ring_used(const pu_uart_ring_t *r) {
-    return (r->head - r->tail) & PU_UART_RING_MASK;
+    size_t h = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+    size_t t = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+    return (h - t) & PU_UART_RING_MASK;
 }
 
 static size_t ring_free(const pu_uart_ring_t *r) {
     return PU_UART_RING_USABLE_CAP - ring_used(r);
+}
+
+static void add_rx_drops(uint32_t delta) {
+    uint32_t cur = __atomic_load_n(&s_rx_drops, __ATOMIC_RELAXED);
+    for (;;) {
+        uint32_t next = (cur > UINT32_MAX - delta) ? UINT32_MAX : (cur + delta);
+        if (__atomic_compare_exchange_n(&s_rx_drops, &cur, next, false,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
 }
 
 static size_t ring_push(pu_uart_ring_t *r, const uint8_t *data, size_t len) {
@@ -143,9 +157,7 @@ pu_uart_line_coding_t pu_uart_bridge_current_coding(void) {
 size_t pu_uart_bridge_rx_push(const uint8_t *data, size_t len) {
     size_t written = ring_push(&s_rx_ring, data, len);
     if (written < len) {
-        uint32_t delta = (uint32_t)(len - written);
-        uint32_t cur = s_rx_drops;
-        s_rx_drops = (cur > UINT32_MAX - delta) ? UINT32_MAX : (cur + delta);
+        add_rx_drops((uint32_t)(len - written));
     }
     return written;
 }
@@ -159,7 +171,7 @@ size_t pu_uart_bridge_rx_available(void) {
 }
 
 uint32_t pu_uart_bridge_rx_drop_count(void) {
-    return s_rx_drops;
+    return __atomic_load_n(&s_rx_drops, __ATOMIC_ACQUIRE);
 }
 
 size_t pu_uart_bridge_tx_push(const uint8_t *data, size_t len) {
@@ -179,10 +191,35 @@ size_t pu_uart_bridge_tx_available(void) {
 }
 
 #if !defined(PU_HOST_TEST)
+/* Naturally aligned 2 KiB circular DMA ring buffer (2^11 = 2048 bytes) for 3 Mbaud RX */
+#define PU_UART_DMA_RING_BITS 11u
+static uint8_t s_dma_rx_buf[PU_UART_RING_SIZE] __attribute__((aligned(PU_UART_RING_SIZE)));
+static int s_dma_rx_chan = -1;
+static size_t s_dma_rx_tail = 0u;
+
+static void rp2040_uart0_dma_rx_arm(void) {
+    if (s_dma_rx_chan < 0) {
+        return;
+    }
+    dma_channel_config cfg = dma_channel_get_default_config((uint)s_dma_rx_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_8);
+    channel_config_set_read_increment(&cfg, false);
+    channel_config_set_write_increment(&cfg, true);
+    channel_config_set_ring(&cfg, true /* write ring */, PU_UART_DMA_RING_BITS);
+    channel_config_set_dreq(&cfg, DREQ_UART0_RX);
+    dma_channel_configure((uint)s_dma_rx_chan, &cfg,
+                          s_dma_rx_buf,
+                          &uart_get_hw(uart0)->dr,
+                          0xFFFFFFFFu,
+                          true);
+}
+
 static void rp2040_uart0_configure_hw(const pu_uart_line_coding_t *coding) {
     if (coding == NULL) {
         return;
     }
+    /* Drain pending TX cleanly before reconfiguring PL011 baud/frame registers */
+    uart_tx_wait_blocking(uart0);
     uart_set_baudrate(uart0, coding->baud);
     uart_parity_t p = UART_PARITY_NONE;
     if (coding->parity == PU_UART_PARITY_ODD) {
@@ -202,10 +239,32 @@ static void rp2040_uart0_drain_tx(void) {
     }
 }
 
-static void rp2040_uart0_rx_irq(void) {
-    while (uart_is_readable(uart0)) {
-        uint8_t ch = (uint8_t)uart_getc(uart0);
-        (void)pu_uart_bridge_rx_push(&ch, 1u);
+static void rp2040_uart0_poll_dma_rx(void) {
+    /* Track hardware PL011 RX FIFO overruns explicitly */
+    if ((uart_get_hw(uart0)->rsr & UART_UARTRSR_OE_BITS) != 0u) {
+        uart_get_hw(uart0)->rsr = UART_UARTRSR_OE_BITS;
+        add_rx_drops(1u);
+    }
+    if (s_dma_rx_chan < 0) {
+        return;
+    }
+    uintptr_t wr_addr = dma_hw->ch[(uint)s_dma_rx_chan].write_addr;
+    uintptr_t base_addr = (uintptr_t)s_dma_rx_buf;
+    size_t head = (size_t)((wr_addr - base_addr) & PU_UART_RING_MASK);
+    if (head != s_dma_rx_tail) {
+        if (head > s_dma_rx_tail) {
+            (void)pu_uart_bridge_rx_push(&s_dma_rx_buf[s_dma_rx_tail], head - s_dma_rx_tail);
+        } else {
+            (void)pu_uart_bridge_rx_push(&s_dma_rx_buf[s_dma_rx_tail], PU_UART_RING_SIZE - s_dma_rx_tail);
+            if (head > 0u) {
+                (void)pu_uart_bridge_rx_push(s_dma_rx_buf, head);
+            }
+        }
+        s_dma_rx_tail = head;
+    }
+    if (!dma_channel_is_busy((uint)s_dma_rx_chan)) {
+        s_dma_rx_tail = 0u;
+        rp2040_uart0_dma_rx_arm();
     }
 }
 
@@ -225,12 +284,14 @@ void pu_uart_bridge_rp2040_init(void) {
     uart_set_format(uart0, 8u, 1u, UART_PARITY_NONE);
     uart_set_fifo_enabled(uart0, true);
 
-    irq_set_exclusive_handler(UART0_IRQ, rp2040_uart0_rx_irq);
-    irq_set_enabled(UART0_IRQ, true);
-    uart_set_irq_enables(uart0, true, false);
+    s_dma_rx_tail = 0u;
+    s_dma_rx_chan = dma_claim_unused_channel(true);
+    rp2040_uart0_dma_rx_arm();
 }
 
 void pu_uart_bridge_task(void) {
+    rp2040_uart0_poll_dma_rx();
+
     /* Host CDC -> Target UART0 TX */
     if (tud_cdc_n_available(PU_TUD_CDC_IDX_UART) > 0u) {
         uint8_t buf[64];
@@ -245,8 +306,8 @@ void pu_uart_bridge_task(void) {
     }
     rp2040_uart0_drain_tx();
 
-    /* Target UART0 RX -> Host CDC */
-    if (tud_cdc_n_connected(PU_TUD_CDC_IDX_UART)) {
+    /* Target UART0 RX -> Host CDC (gate on tud_mounted, not DTR, for Linux termios compatibility) */
+    if (tud_mounted()) {
         uint32_t wr_avail = tud_cdc_n_write_available(PU_TUD_CDC_IDX_UART);
         if (wr_avail > 0u && pu_uart_bridge_rx_available() > 0u) {
             uint8_t buf[64];

@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "firmware/engine_owner.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -63,6 +65,7 @@ typedef struct {
     bool (*is_overcurrent_active)(void);
     uint16_t (*read_adc_vtref_raw)(void);
     uint16_t (*read_adc_itarg_raw)(void);
+    pu_status_t (*request_ch32_unbrick)(uint64_t now_us);
     void (*enter_bootsel)(void);
     uint64_t (*now_us)(void);
 } pu_ctrl_hal_t;
@@ -77,6 +80,9 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
                               uint8_t *resp,
                               size_t cap);
 
+/* Polled after flushing the USB status reply so ENTER_BOOTSEL shuts down cleanly */
+bool pu_ctrl_poll_deferred_bootsel(void);
+
 /* Invoked by VTARG_FAULT_N falling-edge IRQ on PU_BOARD_PRO_PCB (Review Focus #5) */
 void pu_telemetry_on_overcurrent_irq(void);
 
@@ -85,7 +91,8 @@ uint16_t pu_telemetry_adc_to_vtref_mv(uint16_t raw_adc);
 uint16_t pu_telemetry_adc_to_itarg_ma(uint16_t raw_adc);
 
 #if !defined(PU_HOST_TEST)
-void pu_ctrl_rp2040_init(uint8_t active_slot);
+void pu_ctrl_rp2040_init(uint8_t active_slot,
+                         pu_status_t (*request_ch32_unbrick_cb)(uint64_t now_us));
 #endif
 
 #ifdef __cplusplus

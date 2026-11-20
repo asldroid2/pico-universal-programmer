@@ -369,9 +369,8 @@ bool rp2040_swio_read_reg(uint8_t reg_addr, uint32_t *out_val, uint32_t timeout_
 
 #if PU_HAS_VTARG_SWITCH
 void rp2040_swio_set_vtarg(bool enabled) {
-    gpio_init(PU_PIN_VTARG_EN);
+    /* Pin direction is initialized once by pu_ctrl_rp2040_init(); avoid gpio_init() glitch. */
     gpio_put(PU_PIN_VTARG_EN, enabled);
-    gpio_set_dir(PU_PIN_VTARG_EN, GPIO_OUT);
 }
 #endif
 
@@ -3234,6 +3233,10 @@ pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us) {
         s_wire.delay_us(50000u);
     }
 
+    if (pu_engine_current() == PU_ENGINE_FAULT) {
+        return PU_ERR_FAULT_LATCHED;
+    }
+
     /* Open SWIO bus and turn VTARG ON with ZERO blind sleep: immediately poll
      * DMCONTROL = 0x80000001 across POR so PD1-reusing sketches never reach main(). */
     wire_bus_open();
@@ -3242,6 +3245,9 @@ pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us) {
     const uint64_t t0 = wire_now_us(now_us);
     bool caught = false;
     for (uint32_t attempt = 0u; attempt < 4096u; ++attempt) {
+        if (pu_engine_current() == PU_ENGINE_FAULT) {
+            return PU_ERR_FAULT_LATCHED;
+        }
         (void)wire_write(kWchDmShdwCfgr, kWchCfgrKey | kWchCfgrOutEnBit);
         (void)wire_write(kWchDmCfgr, kWchCfgrKey | kWchCfgrOutEnBit);
         if (wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlDmActive)) {
@@ -3298,7 +3304,7 @@ void pu_ch32_on_disconnect(void) {
         }
         wire_bus_close();
         (void)pu_engine_release(PU_ENGINE_SWIO);
-    } else {
+    } else if (pu_engine_current() != PU_ENGINE_RECOVERY) {
         wire_bus_close();
     }
     s_gdb_session_open = false;

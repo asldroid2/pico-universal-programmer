@@ -23,7 +23,9 @@
 
 static bool g_vtarg_enabled = false;
 static bool g_hw_fault_asserted = false;
+static bool g_sync_oc_on_vtarg_on = false;
 static bool g_bootsel_called = false;
+static bool g_unbrick_hook_called = false;
 static uint16_t g_fake_adc_vtref_raw = 2482u; /* ~3.300 V via 2:1 divider on 3.3 V ADC ref */
 static uint16_t g_fake_adc_itarg_raw = 620u;  /* ~250 mA via INA180A1 (20 V/V) * 0.1 Ohm */
 static int g_tristate_calls = 0;
@@ -31,11 +33,22 @@ static int g_tristate_calls = 0;
 static void fake_drain_pio(void) {}
 static void fake_tristate(void) { g_tristate_calls++; }
 static void fake_set_swio_pu(bool en) { (void)en; }
-static void fake_set_vtarg(bool en) { g_vtarg_enabled = en; }
+static void fake_set_vtarg(bool en) {
+    g_vtarg_enabled = en;
+    if (en && g_sync_oc_on_vtarg_on) {
+        g_hw_fault_asserted = true;
+        pu_telemetry_on_overcurrent_irq();
+    }
+}
 
 static bool fake_read_fault_active(void) { return g_hw_fault_asserted; }
 static uint16_t fake_read_adc_vtref(void) { return g_fake_adc_vtref_raw; }
 static uint16_t fake_read_adc_itarg(void) { return g_fake_adc_itarg_raw; }
+static pu_status_t fake_request_unbrick(uint64_t now_us) {
+    (void)now_us;
+    g_unbrick_hook_called = true;
+    return PU_OK;
+}
 static void fake_enter_bootsel(void) { g_bootsel_called = true; }
 static uint64_t fake_now_us(void) { return 50000u; }
 
@@ -56,6 +69,7 @@ static const pu_ctrl_hal_t kProCtrlHal = {
     .is_overcurrent_active = fake_read_fault_active,
     .read_adc_vtref_raw = fake_read_adc_vtref,
     .read_adc_itarg_raw = fake_read_adc_itarg,
+    .request_ch32_unbrick = fake_request_unbrick,
     .enter_bootsel = fake_enter_bootsel,
     .now_us = fake_now_us,
 };
@@ -70,6 +84,7 @@ static const pu_ctrl_hal_t kPicoCtrlHal = {
     .is_overcurrent_active = NULL,
     .read_adc_vtref_raw = NULL,
     .read_adc_itarg_raw = NULL,
+    .request_ch32_unbrick = NULL,
     .enter_bootsel = fake_enter_bootsel,
     .now_us = fake_now_us,
 };
@@ -144,11 +159,18 @@ static void test_ctrl_info_telemetry_and_selftest(void) {
     uint8_t info_req[1] = { PU_CTRL_CMD_GET_INFO };
     uint8_t resp[64] = {0};
     size_t n = pu_ctrl_handle_request(info_req, sizeof(info_req), resp, sizeof(resp));
-    assert(n == 12u && resp[0] == PU_CTRL_CMD_GET_INFO && resp[1] == PU_CTRL_STATUS_OK);
+    assert(n == 13u && resp[0] == PU_CTRL_CMD_GET_INFO && resp[1] == PU_CTRL_STATUS_OK);
     assert(resp[2] == PU_FW_VERSION_MAJOR && resp[3] == PU_FW_VERSION_MINOR);
     assert(resp[5] == 1u); /* board_is_pro_pcb */
     assert((resp[6] & PU_CAP_ADC_TELEMETRY) != 0u);
     assert((resp[6] & PU_CAP_VTARG_SWITCH) != 0u);
+    assert(read_u32_le(&resp[9]) == 0u);
+
+    /* Verify GET_INFO preserves all 32 fault_mask bits including [23:16] */
+    pu_engine_latch_fault(0x805A3C01u);
+    n = pu_ctrl_handle_request(info_req, sizeof(info_req), resp, sizeof(resp));
+    assert(n == 13u && read_u32_le(&resp[9]) == 0x805A3C01u);
+    assert(pu_engine_clear_fault() == PU_OK);
 
     uint8_t tel_req[1] = { PU_CTRL_CMD_GET_TELEMETRY };
     n = pu_ctrl_handle_request(tel_req, sizeof(tel_req), resp, sizeof(resp));
@@ -166,6 +188,28 @@ static void test_ctrl_info_telemetry_and_selftest(void) {
     assert((st_bits & PU_SELFTEST_ENGINE_OK) != 0u);
     assert((st_bits & PU_SELFTEST_ADC_RAIL_OK) != 0u);
 
+    /* Over-voltage ADC reading (> 5600 mV) must fail PU_SELFTEST_ADC_RAIL_OK */
+    g_fake_adc_vtref_raw = 3900u; /* ~6284 mV */
+    n = pu_ctrl_handle_request(st_req, sizeof(st_req), resp, sizeof(resp));
+    assert(n == 6u && (read_u32_le(&resp[2]) & PU_SELFTEST_ADC_RAIL_OK) == 0u);
+    g_fake_adc_vtref_raw = 2048u;
+
+    /* Synchronous overcurrent firing inside set_vtarg_power(true) must NOT report OK */
+    g_sync_oc_on_vtarg_on = true;
+    uint8_t set_on_oc[2] = { PU_CTRL_CMD_SET_VTARG, 1u };
+    n = pu_ctrl_handle_request(set_on_oc, sizeof(set_on_oc), resp, sizeof(resp));
+    g_sync_oc_on_vtarg_on = false;
+    assert(n >= 2u && resp[1] == PU_CTRL_STATUS_FAULT_LATCHED);
+    assert(g_vtarg_enabled == false && pu_engine_current() == PU_ENGINE_FAULT);
+    g_hw_fault_asserted = false;
+    assert(pu_engine_clear_fault() == PU_OK);
+
+    /* CH32_UNBRICK routes through request_ch32_unbrick hook */
+    g_unbrick_hook_called = false;
+    uint8_t unbrick_req[1] = { PU_CTRL_CMD_CH32_UNBRICK };
+    n = pu_ctrl_handle_request(unbrick_req, sizeof(unbrick_req), resp, sizeof(resp));
+    assert(n == 2u && resp[1] == PU_CTRL_STATUS_OK && g_unbrick_hook_called);
+
     /* PICO profile: VTARG switch unsupported, telemetry_supported == 0 */
     pu_ctrl_init(&kPicoCtrlHal);
     uint8_t set_on[2] = { PU_CTRL_CMD_SET_VTARG, 1u };
@@ -179,6 +223,7 @@ static void test_ctrl_info_telemetry_and_selftest(void) {
 
 static void test_ctrl_bootsel_requires_magic_confirmation(void) {
     g_bootsel_called = false;
+    g_vtarg_enabled = true;
     pu_engine_init(&kPinHal);
     pu_ctrl_init(&kProCtrlHal);
 
@@ -186,6 +231,7 @@ static void test_ctrl_bootsel_requires_magic_confirmation(void) {
     uint8_t resp[32] = {0};
     size_t n = pu_ctrl_handle_request(bad_short, sizeof(bad_short), resp, sizeof(resp));
     assert(n >= 2u && resp[1] == PU_CTRL_STATUS_INVALID_ARG && !g_bootsel_called);
+    assert(!pu_ctrl_poll_deferred_bootsel());
 
     uint8_t bad_magic[5] = { PU_CTRL_CMD_ENTER_BOOTSEL, 0x11u, 0x22u, 0x33u, 0x44u };
     n = pu_ctrl_handle_request(bad_magic, sizeof(bad_magic), resp, sizeof(resp));
@@ -193,7 +239,10 @@ static void test_ctrl_bootsel_requires_magic_confirmation(void) {
 
     uint8_t good_magic[5] = { PU_CTRL_CMD_ENTER_BOOTSEL, 0x10u, 0x5Eu, 0x07u, 0xB0u };
     n = pu_ctrl_handle_request(good_magic, sizeof(good_magic), resp, sizeof(resp));
-    assert(n == 2u && resp[1] == PU_CTRL_STATUS_OK && g_bootsel_called);
+    /* Deferred until caller flushes USB OK reply */
+    assert(n == 2u && resp[1] == PU_CTRL_STATUS_OK && !g_bootsel_called);
+    assert(pu_ctrl_poll_deferred_bootsel() == true);
+    assert(g_bootsel_called == true && g_vtarg_enabled == false);
 }
 
 static void test_uart_bridge_ring_buffer_line_coding_and_drop_counter(void) {

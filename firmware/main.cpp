@@ -65,8 +65,46 @@ DapPacketQueue g_dap_req_q{};
 DapPacketQueue g_dap_resp_q{};
 ByteSpscRing g_swio_rx_q{};
 ByteSpscRing g_swio_tx_q{};
+volatile bool g_core1_lockout_ready = false;
 volatile bool g_dap_disconnect_pending = false;
 volatile bool g_swio_disconnect_pending = false;
+volatile bool g_ch32_unbrick_pending = false;
+volatile bool g_dap_resp_flush_pending = false;
+volatile bool g_swio_tx_flush_pending = false;
+
+size_t dap_q_free(const DapPacketQueue &q) {
+    uint32_t h = __atomic_load_n(&q.head, __ATOMIC_ACQUIRE);
+    uint32_t t = __atomic_load_n(&q.tail, __ATOMIC_ACQUIRE);
+    return kDapQueueDepth - static_cast<size_t>(h - t);
+}
+
+void dap_q_drain_consumer(DapPacketQueue &q) {
+    uint32_t h = __atomic_load_n(&q.head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&q.tail, h, __ATOMIC_RELEASE);
+}
+
+void byte_q_drain_consumer(ByteSpscRing &q) {
+    uint32_t h = __atomic_load_n(&q.head, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&q.tail, h, __ATOMIC_RELEASE);
+}
+
+pu_status_t core0_request_ch32_unbrick(uint64_t now_us) {
+    (void)now_us;
+#if !PU_HAS_VTARG_SWITCH
+    return PU_ERR_INVALID_ARG;
+#else
+    if (pu_engine_current() == PU_ENGINE_FAULT) {
+        return PU_ERR_FAULT_LATCHED;
+    }
+    if (pu_engine_current() != PU_ENGINE_IDLE) {
+        return PU_ERR_ENGINE_BUSY;
+    }
+    if (__atomic_exchange_n(&g_ch32_unbrick_pending, true, __ATOMIC_ACQ_REL)) {
+        return PU_ERR_ENGINE_BUSY;
+    }
+    return PU_OK;
+#endif
+}
 
 bool dap_q_push(DapPacketQueue &q, const uint8_t *data, size_t len) {
     uint32_t h = q.head;
@@ -241,6 +279,7 @@ void confirm_trial_boot_if_needed(uint8_t running_slot) {
 void core1_protocol_worker(void) {
     /* Allow Core 0 flash_safe_execute() to lock out Core 1 safely during journal commits. */
     multicore_lockout_victim_init();
+    __atomic_store_n(&g_core1_lockout_ready, true, __ATOMIC_RELEASE);
 
     uint8_t dap_req[PU_DAP_PACKET_SIZE];
     uint8_t dap_resp[PU_DAP_PACKET_SIZE];
@@ -251,19 +290,35 @@ void core1_protocol_worker(void) {
         uint64_t now_us = time_us_64();
 
         if (__atomic_exchange_n(&g_dap_disconnect_pending, false, __ATOMIC_ACQ_REL)) {
+            dap_q_drain_consumer(g_dap_req_q);
+            __atomic_store_n(&g_dap_resp_flush_pending, true, __ATOMIC_RELEASE);
             pu_dap_on_usb_disconnect();
         }
         if (__atomic_exchange_n(&g_swio_disconnect_pending, false, __ATOMIC_ACQ_REL)) {
+            byte_q_drain_consumer(g_swio_rx_q);
+            __atomic_store_n(&g_swio_tx_flush_pending, true, __ATOMIC_RELEASE);
             pu_ch32_on_disconnect();
         }
 
+        if (pu_engine_current() == PU_ENGINE_FAULT) {
+            /* Keep PIO0/PIO1 quiescent while hardware fault is latched */
+            __atomic_store_n(&g_ch32_unbrick_pending, false, __ATOMIC_RELEASE);
+            pu_dap_on_usb_disconnect();
+            pu_ch32_on_disconnect();
+            tight_loop_contents();
+            continue;
+        }
+
+        if (__atomic_exchange_n(&g_ch32_unbrick_pending, false, __ATOMIC_ACQ_REL)) {
+            (void)pu_ch32_power_cycle_unbrick(now_us);
+        }
+
+        /* Only pop a DAP request when response queue has room (zero blocking spin) */
         size_t req_len = 0u;
-        if (dap_q_pop(g_dap_req_q, dap_req, &req_len)) {
+        if (dap_q_free(g_dap_resp_q) > 0u && dap_q_pop(g_dap_req_q, dap_req, &req_len)) {
             size_t resp_len = pu_dap_process_packet(dap_req, req_len, dap_resp, sizeof(dap_resp), now_us);
             if (resp_len > 0u) {
-                while (!dap_q_push(g_dap_resp_q, dap_resp, resp_len)) {
-                    tight_loop_contents();
-                }
+                (void)dap_q_push(g_dap_resp_q, dap_resp, resp_len);
             }
         }
 
@@ -282,10 +337,16 @@ void core1_protocol_worker(void) {
 }
 
 void pump_usb_endpoints(void) {
+    if (__atomic_exchange_n(&g_dap_resp_flush_pending, false, __ATOMIC_ACQ_REL)) {
+        dap_q_drain_consumer(g_dap_resp_q);
+    }
+    if (__atomic_exchange_n(&g_swio_tx_flush_pending, false, __ATOMIC_ACQ_REL)) {
+        byte_q_drain_consumer(g_swio_tx_q);
+    }
+
     /* IF 0: CMSIS-DAP v2 Bulk OUT -> Core 1 req queue */
     if (tud_vendor_n_available(PU_TUD_VENDOR_IDX_DAP) > 0u) {
-        uint32_t pending = g_dap_req_q.head - __atomic_load_n(&g_dap_req_q.tail, __ATOMIC_ACQUIRE);
-        if (pending < kDapQueueDepth) {
+        if (dap_q_free(g_dap_req_q) > 0u) {
             uint8_t buf[PU_DAP_PACKET_SIZE];
             uint32_t n = tud_vendor_n_read(PU_TUD_VENDOR_IDX_DAP, buf, sizeof(buf));
             if (n > 0u) {
@@ -303,7 +364,7 @@ void pump_usb_endpoints(void) {
         }
     }
 
-    /* IF 1..2: CH32V003 SWIO CDC <-> Core 1 byte queues */
+    /* IF 1..2: CH32V003 SWIO CDC <-> Core 1 byte queues (gate TX on tud_mounted, not DTR) */
     if (tud_cdc_n_available(PU_TUD_CDC_IDX_SWIO) > 0u) {
         size_t rx_free = (kSwioRingCap - 1u) - byte_q_used(g_swio_rx_q);
         if (rx_free > 0u) {
@@ -315,7 +376,7 @@ void pump_usb_endpoints(void) {
             }
         }
     }
-    if (tud_cdc_n_connected(PU_TUD_CDC_IDX_SWIO)) {
+    if (tud_mounted()) {
         uint32_t wr_avail = tud_cdc_n_write_available(PU_TUD_CDC_IDX_SWIO);
         if (wr_avail > 0u && byte_q_used(g_swio_tx_q) > 0u) {
             uint8_t buf[64];
@@ -398,10 +459,14 @@ int main(void) {
     pu_dap_init(nullptr);
     pu_swio_init(nullptr);
     pu_uart_bridge_rp2040_init();
-    pu_ctrl_rp2040_init(active_slot);
+    pu_ctrl_rp2040_init(active_slot, core0_request_ch32_unbrick);
 
-    /* Launch Core 1 protocol worker before confirming trial boot so lockout victim is armed */
+    /* Launch Core 1 protocol worker and wait until lockout victim is armed before flash ops */
+    __atomic_store_n(&g_core1_lockout_ready, false, __ATOMIC_RELEASE);
     multicore_launch_core1(core1_protocol_worker);
+    while (!__atomic_load_n(&g_core1_lockout_ready, __ATOMIC_ACQUIRE)) {
+        tight_loop_contents();
+    }
 
     tusb_init();
     confirm_trial_boot_if_needed(active_slot);
@@ -410,6 +475,13 @@ int main(void) {
     for (;;) {
         tud_task();
         pump_usb_endpoints();
+        if (pu_ctrl_poll_deferred_bootsel()) {
+            /* Flush USB reply briefly before ROM jump if enter_bootsel returned */
+            for (int i = 0; i < 20; ++i) {
+                tud_task();
+                busy_wait_us_32(1000u);
+            }
+        }
         uint64_t now_us = time_us_64();
         pu_engine_tick(now_us);
         leds_update(now_us);

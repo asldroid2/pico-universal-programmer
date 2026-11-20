@@ -1,9 +1,12 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Board profile & approved Raspberry Pi USB Product ID (VID 0x2E8A)
+# Board profile, slot selection, & approved Raspberry Pi USB Product ID (VID 0x2E8A)
 set(PU_BOARD "PICO" CACHE STRING "Target hardware profile: PICO or PRO_PCB")
 set_property(CACHE PU_BOARD PROPERTY STRINGS "PICO" "PRO_PCB")
+set(PU_SLOT "A" CACHE STRING "Target A/B firmware link slot: A or B")
+set_property(CACHE PU_SLOT PROPERTY STRINGS "A" "B")
 set(PU_USB_PID "0x0000" CACHE STRING "Approved 16-bit Raspberry Pi USB Product ID (e.g. 0x1234)")
+set(PICO_NO_UF2 1)
 
 if(PU_BOARD STREQUAL "PRO_PCB")
     set(PU_BOARD_DEFINE "PU_BOARD_PRO_PCB=1")
@@ -13,8 +16,17 @@ else()
     message(FATAL_ERROR "Unsupported PU_BOARD='${PU_BOARD}'. Expected PICO or PRO_PCB.")
 endif()
 
-# Include Pico SDK configuration
+if(PU_SLOT STREQUAL "A")
+    set(PU_SLOT_NAME "app_slot_a")
+elseif(PU_SLOT STREQUAL "B")
+    set(PU_SLOT_NAME "app_slot_b")
+else()
+    message(FATAL_ERROR "Unsupported PU_SLOT='${PU_SLOT}'. Expected A or B.")
+endif()
+
+# Include Pico SDK configuration & slot linker generator
 include(pico_sdk_import.cmake)
+include(cmake/SlotLinker.cmake)
 
 project(pico_universal_programmer C CXX ASM)
 
@@ -65,6 +77,7 @@ target_link_libraries(pu_bootloader PRIVATE
 
 pico_enable_stdio_usb(pu_bootloader 0)
 pico_enable_stdio_uart(pu_bootloader 0)
+pu_configure_flash_slot(pu_bootloader bootloader TRUE)
 pico_add_extra_outputs(pu_bootloader)
 
 # ----------------------------------------------------------------------------
@@ -116,6 +129,7 @@ target_link_libraries(pu_firmware PRIVATE
     tinyusb_board
     hardware_adc
     hardware_clocks
+    hardware_dma
     hardware_flash
     hardware_gpio
     hardware_irq
@@ -127,6 +141,7 @@ target_link_libraries(pu_firmware PRIVATE
 
 pico_enable_stdio_usb(pu_firmware 0)
 pico_enable_stdio_uart(pu_firmware 0)
+pu_configure_flash_slot(pu_firmware ${PU_SLOT_NAME} FALSE)
 pico_add_extra_outputs(pu_firmware)
 
 # Unified 4 KiB sector-padded UF2 packaging target

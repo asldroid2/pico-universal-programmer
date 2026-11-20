@@ -32,6 +32,7 @@
 
 static pu_ctrl_hal_t s_hal;
 static volatile bool s_vtarg_enabled = false;
+static volatile bool s_bootsel_pending = false;
 
 static void write_u16_le(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)(v & 0xFFu);
@@ -73,6 +74,7 @@ void pu_ctrl_init(const pu_ctrl_hal_t *hal) {
         memset(&s_hal, 0, sizeof(s_hal));
     }
     s_vtarg_enabled = false;
+    s_bootsel_pending = false;
 }
 
 #ifdef PU_HOST_TEST
@@ -94,6 +96,7 @@ void pu_ctrl_init_for_test(void) {
         .is_overcurrent_active = host_test_oc_active,
         .read_adc_vtref_raw = host_test_adc_vtref,
         .read_adc_itarg_raw = host_test_adc_itarg,
+        .request_ch32_unbrick = NULL,
         .enter_bootsel = NULL,
         .now_us = host_test_now_us
     };
@@ -108,6 +111,21 @@ void pu_telemetry_on_overcurrent_irq(void) {
         s_hal.set_vtarg_power(false);
     }
     pu_engine_latch_fault(PU_FAULT_OVERCURRENT);
+}
+
+bool pu_ctrl_poll_deferred_bootsel(void) {
+    if (!__atomic_exchange_n(&s_bootsel_pending, false, __ATOMIC_ACQ_REL)) {
+        return false;
+    }
+    s_vtarg_enabled = false;
+    if (s_hal.set_vtarg_power != NULL) {
+        s_hal.set_vtarg_power(false);
+    }
+    pu_engine_on_usb_reset();
+    if (s_hal.enter_bootsel != NULL) {
+        s_hal.enter_bootsel();
+    }
+    return true;
 }
 
 static size_t write_status_reply(uint8_t *resp, size_t cap, uint8_t cmd, pu_ctrl_status_t st) {
@@ -130,7 +148,7 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
     uint8_t cmd = req[0];
     switch (cmd) {
     case PU_CTRL_CMD_GET_INFO: {
-        if (cap < 12u) {
+        if (cap < 13u) {
             return write_status_reply(resp, cap, cmd, PU_CTRL_STATUS_INVALID_ARG);
         }
         uint8_t caps = 0u;
@@ -152,11 +170,8 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
         resp[6] = caps;
         resp[7] = (uint8_t)pu_engine_current();
         resp[8] = s_hal.active_slot;
-        uint32_t fmask = pu_engine_fault_mask();
-        resp[9] = (uint8_t)(fmask & 0xFFu);
-        resp[10] = (uint8_t)((fmask >> 8) & 0xFFu);
-        resp[11] = (uint8_t)((fmask >> 24) & 0xFFu);
-        return 12u;
+        write_u32_le(&resp[9], pu_engine_fault_mask());
+        return 13u;
     }
 
     case PU_CTRL_CMD_GET_TELEMETRY: {
@@ -203,8 +218,21 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
                 return write_status_reply(resp, cap, cmd, PU_CTRL_STATUS_FAULT_LATCHED);
             }
         }
-        s_hal.set_vtarg_power(want_on);
+        /* Record desired state BEFORE driving the switch so a synchronous overcurrent
+         * ISR inside set_vtarg_power(true) is never clobbered back to true. */
         s_vtarg_enabled = want_on;
+        s_hal.set_vtarg_power(want_on);
+        if (want_on) {
+            bool oc_post = (s_hal.is_overcurrent_active != NULL) ? s_hal.is_overcurrent_active() : false;
+            if (!s_vtarg_enabled || pu_engine_current() == PU_ENGINE_FAULT || oc_post) {
+                s_vtarg_enabled = false;
+                s_hal.set_vtarg_power(false);
+                if (pu_engine_current() != PU_ENGINE_FAULT) {
+                    pu_engine_latch_fault(PU_FAULT_OVERCURRENT);
+                }
+                return write_status_reply(resp, cap, cmd, PU_CTRL_STATUS_FAULT_LATCHED);
+            }
+        }
         resp[0] = cmd;
         resp[1] = (uint8_t)PU_CTRL_STATUS_OK;
         resp[2] = want_on ? 1u : 0u;
@@ -227,7 +255,9 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
 
     case PU_CTRL_CMD_CH32_UNBRICK: {
         uint64_t now_us = (s_hal.now_us != NULL) ? s_hal.now_us() : 0u;
-        pu_status_t st = pu_ch32_power_cycle_unbrick(now_us);
+        pu_status_t st = (s_hal.request_ch32_unbrick != NULL)
+                             ? s_hal.request_ch32_unbrick(now_us)
+                             : pu_ch32_power_cycle_unbrick(now_us);
         if (st == PU_OK) {
             return write_status_reply(resp, cap, cmd, PU_CTRL_STATUS_OK);
         }
@@ -247,9 +277,8 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
         if (len < 5u || read_u32_le(&req[1]) != PU_CTRL_BOOTSEL_MAGIC) {
             return write_status_reply(resp, cap, cmd, PU_CTRL_STATUS_INVALID_ARG);
         }
-        if (s_hal.enter_bootsel != NULL) {
-            s_hal.enter_bootsel();
-        }
+        /* Defer ROM jump until caller flushes this USB OK status reply cleanly */
+        __atomic_store_n(&s_bootsel_pending, true, __ATOMIC_RELEASE);
         return write_status_reply(resp, cap, cmd, PU_CTRL_STATUS_OK);
     }
 
@@ -268,9 +297,10 @@ size_t pu_ctrl_handle_request(const uint8_t *req,
         }
         if (!s_hal.has_adc_telemetry) {
             bits |= PU_SELFTEST_ADC_RAIL_OK;
-        } else if (s_hal.read_adc_vtref_raw != NULL) {
-            uint16_t raw = s_hal.read_adc_vtref_raw();
-            if (raw <= 4095u) {
+        } else if (s_hal.read_adc_vtref_raw != NULL && s_hal.read_adc_itarg_raw != NULL) {
+            uint16_t vtref_mv = pu_telemetry_adc_to_vtref_mv(s_hal.read_adc_vtref_raw());
+            uint16_t itarg_ma = pu_telemetry_adc_to_itarg_ma(s_hal.read_adc_itarg_raw());
+            if (vtref_mv <= 5600u && itarg_ma <= 550u) {
                 bits |= PU_SELFTEST_ADC_RAIL_OK;
             }
         }
@@ -303,22 +333,27 @@ static bool rp2040_is_overcurrent_active(void) {
 #endif
 }
 
-static uint16_t rp2040_read_adc_vtref_raw(void) {
+static uint16_t rp2040_adc_sample_averaged(uint input) {
 #if PU_HAS_ADC_TELEMETRY
-    adc_select_input(0u); /* GP26 = ADC0 */
-    return adc_read();
+    adc_select_input(input);
+    (void)adc_read(); /* Discard first conversion to eliminate mux charge cross-talk */
+    uint32_t sum = 0u;
+    for (uint i = 0u; i < 4u; ++i) {
+        sum += adc_read();
+    }
+    return (uint16_t)((sum + 2u) / 4u);
 #else
+    (void)input;
     return 0u;
 #endif
 }
 
+static uint16_t rp2040_read_adc_vtref_raw(void) {
+    return rp2040_adc_sample_averaged(0u); /* GP26 = ADC0 */
+}
+
 static uint16_t rp2040_read_adc_itarg_raw(void) {
-#if PU_HAS_ADC_TELEMETRY
-    adc_select_input(1u); /* GP27 = ADC1 */
-    return adc_read();
-#else
-    return 0u;
-#endif
+    return rp2040_adc_sample_averaged(1u); /* GP27 = ADC1 */
 }
 
 static void rp2040_enter_bootsel(void) {
@@ -337,7 +372,8 @@ static void rp2040_vtarg_fault_gpio_cb(uint gpio, uint32_t events) {
 }
 #endif
 
-void pu_ctrl_rp2040_init(uint8_t active_slot) {
+void pu_ctrl_rp2040_init(uint8_t active_slot,
+                         pu_status_t (*request_ch32_unbrick_cb)(uint64_t now_us)) {
 #if PU_HAS_VTARG_SWITCH
     gpio_init(PU_PIN_VTARG_EN);
     gpio_put(PU_PIN_VTARG_EN, false);
@@ -346,8 +382,7 @@ void pu_ctrl_rp2040_init(uint8_t active_slot) {
     gpio_init(PU_PIN_VTARG_FAULT_N);
     gpio_set_dir(PU_PIN_VTARG_FAULT_N, GPIO_IN);
     gpio_pull_up(PU_PIN_VTARG_FAULT_N);
-    gpio_set_irq_enabled_with_callback(PU_PIN_VTARG_FAULT_N, GPIO_IRQ_EDGE_FALL, true,
-                                       rp2040_vtarg_fault_gpio_cb);
+    busy_wait_us_32(100u); /* Settle internal pull-up before sampling/arming IRQ */
 #endif
 #if PU_HAS_ADC_TELEMETRY
     adc_init();
@@ -370,8 +405,18 @@ void pu_ctrl_rp2040_init(uint8_t active_slot) {
     hal.is_overcurrent_active = (PU_HAS_VTARG_SWITCH != 0) ? rp2040_is_overcurrent_active : NULL;
     hal.read_adc_vtref_raw = (PU_HAS_ADC_TELEMETRY != 0) ? rp2040_read_adc_vtref_raw : NULL;
     hal.read_adc_itarg_raw = (PU_HAS_ADC_TELEMETRY != 0) ? rp2040_read_adc_itarg_raw : NULL;
+    hal.request_ch32_unbrick = request_ch32_unbrick_cb;
     hal.enter_bootsel = rp2040_enter_bootsel;
     hal.now_us = rp2040_ctrl_now_us;
     pu_ctrl_init(&hal);
+
+#if PU_HAS_VTARG_SWITCH
+    /* Catch already-asserted level-LOW hardware faults before enabling edge IRQ */
+    if (!gpio_get(PU_PIN_VTARG_FAULT_N)) {
+        pu_telemetry_on_overcurrent_irq();
+    }
+    gpio_set_irq_enabled_with_callback(PU_PIN_VTARG_FAULT_N, GPIO_IRQ_EDGE_FALL, true,
+                                       rp2040_vtarg_fault_gpio_cb);
+#endif
 }
 #endif

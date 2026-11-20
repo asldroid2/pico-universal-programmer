@@ -13,6 +13,10 @@ enum {
 #ifndef PU_HOST_TEST
 #undef FLASH_PAGE_SIZE
 #undef FLASH_SECTOR_SIZE
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wundef"
+#endif
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #if defined(__has_include)
@@ -20,6 +24,9 @@ enum {
 #include "pico/flash.h"
 #define PU_HAS_PICO_FLASH 1
 #endif
+#endif
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 #ifndef PU_HAS_PICO_FLASH
 #define PU_HAS_PICO_FLASH 0

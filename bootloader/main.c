@@ -18,11 +18,18 @@
 #include "config/flash_layout.h"
 
 #if !defined(PU_HOST_TEST)
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wundef"
+#endif
 #include "hardware/gpio.h"
 #include "hardware/resets.h"
 #include "hardware/sync.h"
 #include "pico/bootrom.h"
 #include "pico/time.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 #endif
 
 extern void pu_bootloader_handover(uint32_t vtor, uint32_t initial_msp, uint32_t entry_point)
