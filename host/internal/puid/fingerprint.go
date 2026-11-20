@@ -13,8 +13,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/catalog"
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/gdbpipe"
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/usbprobe"
 )
 
@@ -50,6 +52,7 @@ type CheckReport struct {
 	IsClone     bool     `json:"is_clone"`
 	FlashKB     int      `json:"flash_kb,omitempty"`
 	VTrefMV     int      `json:"vtref_mv,omitempty"`
+	ITargMA     int      `json:"itarg_ma,omitempty"`
 	Ready       bool     `json:"ready"`
 	Remediation []string `json:"remediation,omitempty"`
 }
@@ -92,6 +95,9 @@ func (r CheckReport) FormatHuman() string {
 	}
 	if r.VTrefMV > 0 {
 		fmt.Fprintf(&b, "  VTREF:        %d mV\n", r.VTrefMV)
+	}
+	if r.ITargMA > 0 {
+		fmt.Fprintf(&b, "  ITARG:        %d mA\n", r.ITargMA)
 	}
 	if r.Diagnosis != "" {
 		fmt.Fprintf(&b, "  Diagnosis:    %s\n", r.Diagnosis)
@@ -143,6 +149,7 @@ type TargetObservation struct {
 	ROMJEP106     uint16
 	FlashKB       int
 	VTrefMV       int
+	ITargMA       int
 	ReadProtected bool
 	EngineBusy    bool
 	FaultLatched  bool
@@ -177,6 +184,7 @@ func ClassifyTarget(obs TargetObservation) (CheckReport, error) {
 		Family:  family,
 		FlashKB: obs.FlashKB,
 		VTrefMV: obs.VTrefMV,
+		ITargMA: obs.ITargMA,
 	}
 
 	if obs.FaultLatched {
@@ -632,6 +640,15 @@ func ParsePUID1Response(raw string) (CheckReport, error) {
 		}
 		return rep, nil
 
+	case "ERR_UNEXPECTED_STATE":
+		rep.Verdict = "ERR_UNEXPECTED_STATE"
+		rep.Ready = false
+		rep.Diagnosis = "CH32V003 SWIO bus responded, but chip identity or DMSTATUS state was unexpected"
+		rep.Remediation = []string{
+			"Inspect SWIO signal integrity, verify 1 kΩ pull-up to VDD, and run 'pu recover --family ch32v003' if locked up.",
+		}
+		return rep, nil
+
 	default:
 		rep.Verdict = status
 		rep.Ready = false
@@ -755,19 +772,141 @@ func ParseOpenOCDCheckOutput(family, output string) (TargetObservation, error) {
 	return obs, nil
 }
 
-func formatGDBSerialTarget(port string) string {
-	p := strings.TrimSpace(port)
-	upper := strings.ToUpper(p)
-	if strings.HasPrefix(upper, "COM") && len(upper) > 4 && !strings.HasPrefix(p, `\\.\`) {
-		return `\\.\` + p
+// CheckOptions configures transports for CheckTargetWithOptions so unit tests stay offline.
+type CheckOptions struct {
+	Runner          CommandRunner
+	PortOpener      gdbpipe.PortOpener
+	CtrlTransceiver usbprobe.CtrlTransceiver
+}
+
+func isHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func exchangeCH32PUID1(port io.ReadWriter) (string, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	if rd, ok := port.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = rd.SetReadDeadline(deadline)
 	}
-	return p
+	if wd, ok := port.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = wd.SetWriteDeadline(deadline)
+	}
+
+	req := []byte(BuildGDBQRcmdPacket("puid1"))
+	for written := 0; written < len(req); {
+		n, err := port.Write(req[written:])
+		if n > 0 {
+			written += n
+		}
+		if err != nil {
+			return "", fmt.Errorf("puid: write qRcmd puid1 packet: %w", err)
+		}
+	}
+
+	var rxBuf []byte
+	var consoleOut strings.Builder
+	readChunk := make([]byte, 256)
+
+	for {
+		// Parse all complete RSP frames currently buffered in rxBuf.
+		for {
+			// Skip leading '+' ACKs and whitespace; fail immediately on '-' NAK before '$'.
+			for len(rxBuf) > 0 && rxBuf[0] != '$' {
+				if rxBuf[0] == '-' {
+					return "", errors.New("puid: probe NAKed qRcmd puid1 packet")
+				}
+				rxBuf = rxBuf[1:]
+			}
+			if len(rxBuf) == 0 {
+				break
+			}
+			hashIdx := bytes.IndexByte(rxBuf, '#')
+			if hashIdx < 0 || hashIdx+2 >= len(rxBuf) {
+				break
+			}
+
+			payload := string(rxBuf[1:hashIdx])
+			csumHex := string(rxBuf[hashIdx+1 : hashIdx+3])
+			rxBuf = rxBuf[hashIdx+3:]
+
+			wantCsum, err := strconv.ParseUint(csumHex, 16, 8)
+			if err != nil {
+				return "", fmt.Errorf("puid: invalid GDB RSP checksum %q: %w", csumHex, err)
+			}
+			var gotCsum byte
+			for i := 0; i < len(payload); i++ {
+				gotCsum += payload[i]
+			}
+			if gotCsum != byte(wantCsum) {
+				return "", fmt.Errorf("puid: GDB RSP checksum mismatch: got %02x, want %02x", gotCsum, byte(wantCsum))
+			}
+
+			switch {
+			case payload == "OK":
+				return consoleOut.String(), nil
+
+			case payload == "":
+				return "", errors.New("puid: probe returned empty RSP reply (qRcmd puid1 unsupported)")
+
+			case len(payload) == 3 && (payload[0] == 'E' || payload[0] == 'e') && isHexByte(payload[1]) && isHexByte(payload[2]):
+				if strings.Contains(consoleOut.String(), "PUID1:") {
+					return consoleOut.String(), nil
+				}
+				return "", fmt.Errorf("puid: CH32V003 qRcmd puid1 failed with RSP error %q", payload)
+
+			case len(payload) > 1 && payload[0] == 'O' && (len(payload)-1)%2 == 0:
+				decoded, decErr := hex.DecodeString(payload[1:])
+				if decErr != nil {
+					return "", fmt.Errorf("puid: decode RSP $O console payload: %w", decErr)
+				}
+				consoleOut.Write(decoded)
+
+			case len(payload) >= 2 && len(payload)%2 == 0:
+				decoded, decErr := hex.DecodeString(payload)
+				if decErr != nil {
+					return "", fmt.Errorf("puid: decode RSP hex payload: %w", decErr)
+				}
+				consoleOut.Write(decoded)
+				return consoleOut.String(), nil
+
+			default:
+				return "", fmt.Errorf("puid: unexpected GDB RSP reply %q", payload)
+			}
+		}
+
+		if time.Now().After(deadline) {
+			return "", errors.New("puid: timed out waiting for CH32V003 PUID1 RSP reply")
+		}
+		n, rErr := port.Read(readChunk)
+		if n > 0 {
+			rxBuf = append(rxBuf, readChunk[:n]...)
+		}
+		if rErr != nil {
+			if errors.Is(rErr, io.EOF) && consoleOut.Len() > 0 {
+				return consoleOut.String(), nil
+			}
+			return "", fmt.Errorf("puid: read CH32V003 PUID1 RSP reply: %w", rErr)
+		}
+	}
+}
+
+func isCtrlReplyStatus(err error, status byte) bool {
+	var stErr *usbprobe.CtrlReplyError
+	return errors.As(err, &stErr) && stErr.Status == status
 }
 
 // CheckTarget acquires the cross-process probe session lock for probe.Serial, runs a
-// non-destructive target identity check via OpenOCD (SWD/JTAG) or GDB PUID1 (CH32V003),
-// and returns a structured CheckReport.
+// non-destructive target identity check via OpenOCD (SWD/JTAG) or raw CDC qRcmd puid1
+// (CH32V003), and returns a structured CheckReport.
 func CheckTarget(probe usbprobe.ProbeDevice, family string, runner CommandRunner) (CheckReport, error) {
+	return CheckTargetWithOptions(probe, family, CheckOptions{
+		Runner: runner,
+	})
+}
+
+// CheckTargetWithOptions acquires the cross-process probe session lock, queries IF 5
+// telemetry/engine health before touching target wires, and executes the target check.
+func CheckTargetWithOptions(probe usbprobe.ProbeDevice, family string, opts CheckOptions) (CheckReport, error) {
 	normFamily, err := NormalizeFamily(family)
 	if err != nil {
 		return CheckReport{}, err
@@ -775,8 +914,17 @@ func CheckTarget(probe usbprobe.ProbeDevice, family string, runner CommandRunner
 	if strings.TrimSpace(probe.Serial) == "" {
 		return CheckReport{}, errors.New("puid: probe serial must not be empty")
 	}
+	runner := opts.Runner
 	if runner == nil {
 		runner = OSCommandRunner{}
+	}
+	portOpener := opts.PortOpener
+	if portOpener == nil {
+		portOpener = gdbpipe.OpenSerialPort
+	}
+	ctrlTx := opts.CtrlTransceiver
+	if ctrlTx == nil {
+		ctrlTx = usbprobe.DefaultCtrlTransceiver
 	}
 
 	lk, err := usbprobe.AcquireSessionLock(probe.Serial)
@@ -785,41 +933,85 @@ func CheckTarget(probe usbprobe.ProbeDevice, family string, runner CommandRunner
 	}
 	defer lk.Close()
 
+	var liveVTrefMV, liveITargMA int
+	if strings.TrimSpace(probe.CtrlPath) != "" {
+		info, infoErr := usbprobe.QueryInfo(probe, ctrlTx)
+		telem, telemErr := usbprobe.QueryTelemetry(probe, ctrlTx)
+		if telemErr == nil && telem.HasADCTelemetry {
+			liveVTrefMV = int(telem.VTrefMV)
+			liveITargMA = int(telem.ITargMA)
+		}
+
+		faultLatched := (infoErr == nil && (info.EngineState == usbprobe.EngineFault || info.FaultMask != 0)) ||
+			(telemErr == nil && telem.Overcurrent) ||
+			isCtrlReplyStatus(infoErr, usbprobe.CtrlStatusFaultLatched) ||
+			isCtrlReplyStatus(telemErr, usbprobe.CtrlStatusFaultLatched)
+		if faultLatched {
+			rep, clsErr := ClassifyTarget(TargetObservation{
+				Family:       normFamily,
+				VTrefMV:      liveVTrefMV,
+				ITargMA:      liveITargMA,
+				FaultLatched: true,
+			})
+			if clsErr != nil {
+				return CheckReport{}, clsErr
+			}
+			rep.ProbeSerial = probe.Serial
+			return rep, nil
+		}
+
+		engineBusy := (infoErr == nil && info.EngineState != usbprobe.EngineIdle) ||
+			isCtrlReplyStatus(infoErr, usbprobe.CtrlStatusBusy) ||
+			isCtrlReplyStatus(telemErr, usbprobe.CtrlStatusBusy)
+		if engineBusy {
+			rep, clsErr := ClassifyTarget(TargetObservation{
+				Family:     normFamily,
+				VTrefMV:    liveVTrefMV,
+				ITargMA:    liveITargMA,
+				EngineBusy: true,
+			})
+			if clsErr != nil {
+				return CheckReport{}, clsErr
+			}
+			rep.ProbeSerial = probe.Serial
+			return rep, nil
+		}
+	}
+
 	if normFamily == "ch32v003" {
 		if strings.TrimSpace(probe.GDBPort) == "" {
 			return CheckReport{}, fmt.Errorf("puid: probe %s has no CH32 SWIO GDB CDC port", probe.Serial)
 		}
-		gdbBin, lookErr := runner.LookPath("riscv-none-elf-gdb")
-		if lookErr != nil {
-			gdbBin, lookErr = runner.LookPath("gdb-multiarch")
-			if lookErr != nil {
-				return CheckReport{}, fmt.Errorf("puid: riscv-none-elf-gdb not found in PATH: %w", lookErr)
-			}
+		port, openErr := portOpener(probe.GDBPort)
+		if openErr != nil {
+			return CheckReport{}, fmt.Errorf("puid: open CH32 SWIO CDC port %s: %w", probe.GDBPort, openErr)
+		}
+		decoded, exErr := exchangeCH32PUID1(port)
+		_ = port.Close()
+		if exErr != nil {
+			return CheckReport{}, exErr
 		}
 
-		var stdout, stderr bytes.Buffer
-		spec := CommandSpec{
-			Name: gdbBin,
-			Args: []string{
-				"-batch",
-				"-nx",
-				"-ex", "set pagination off",
-				"-ex", "set confirm off",
-				"-ex", "target extended-remote " + formatGDBSerialTarget(probe.GDBPort),
-				"-ex", "monitor puid1",
-				"-ex", "detach",
-			},
-		}
-		runErr := runner.Run(spec, &stdout, &stderr)
-		combined := stdout.String() + "\n" + stderr.String()
-		rep, parseErr := ParsePUID1Response(combined)
+		rep, parseErr := ParsePUID1Response(decoded)
 		if parseErr != nil {
-			if runErr != nil {
-				return CheckReport{}, fmt.Errorf("puid: CH32V003 check failed (%w): %s", runErr, strings.TrimSpace(combined))
-			}
 			return CheckReport{}, parseErr
 		}
 		rep.ProbeSerial = probe.Serial
+		if liveVTrefMV > 0 {
+			rep.VTrefMV = liveVTrefMV
+		}
+		if liveITargMA > 0 {
+			rep.ITargMA = liveITargMA
+		}
+		if rep.Ready && rep.VTrefMV > 0 && (rep.VTrefMV < minValidVTrefMV || rep.VTrefMV > maxValidVTrefMV) {
+			rep.Ready = false
+			rep.Verdict = "ERR_VTREF_OUT_OF_RANGE"
+			rep.Diagnosis = fmt.Sprintf("Measured target VTREF (%d mV) is outside safe 1.8 V - 5.0 V operating range", rep.VTrefMV)
+			rep.Remediation = []string{
+				"Verify target board 3.3 V / VCC power supply is turned on and connected to VTREF.",
+				"Ensure target logic voltage is between 1.8 V (1800 mV) and 5.0 V (5000 mV).",
+			}
+		}
 		return rep, nil
 	}
 
@@ -854,6 +1046,7 @@ func CheckTarget(probe usbprobe.ProbeDevice, family string, runner CommandRunner
 			"-c", "adapter serial " + probe.Serial,
 			"-c", "transport select jtag",
 			"-f", "target/esp32s3.cfg",
+			"-c", "adapter speed 5000",
 			"-c", "init; exit",
 		}
 
@@ -901,6 +1094,12 @@ func CheckTarget(probe usbprobe.ProbeDevice, family string, runner CommandRunner
 	obs, err := ParseOpenOCDCheckOutput(normFamily, combined)
 	if err != nil {
 		return CheckReport{}, err
+	}
+	if obs.VTrefMV == 0 && liveVTrefMV > 0 {
+		obs.VTrefMV = liveVTrefMV
+	}
+	if liveITargMA > 0 {
+		obs.ITargMA = liveITargMA
 	}
 	rep, err := ClassifyTarget(obs)
 	if err != nil {

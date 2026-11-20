@@ -1,6 +1,7 @@
 package gdbpipe
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -302,4 +303,98 @@ func TestServeGDBTCPLoopbackAndRejectsNonLoopback(t *testing.T) {
 	}
 
 	waitForGoroutines(t, baselineG)
+}
+
+func TestRelayGDBStdioEOFDrainsInFlightRSPWithoutTruncation(t *testing.T) {
+	t.Setenv("PU_LOCK_DIR", filepath.Join(t.TempDir(), "locks"))
+	baselineG := runtime.NumGoroutine()
+
+	probe := usbprobe.ProbeDevice{
+		Serial:  "E660GDBEOF000005",
+		VID:     0x2E8A,
+		PID:     0x1050,
+		GDBPort: "/dev/ttyACM0",
+	}
+
+	probeServer, probePort := net.Pipe()
+	defer probeServer.Close()
+
+	go func() {
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(probeServer, buf); err == nil && string(buf) == "$g#67" {
+			// Simulate SWIO wire round-trip latency while stdin has already hit EOF,
+			// and keep probeServer open like a real /dev/ttyACM0 device.
+			time.Sleep(25 * time.Millisecond)
+			_, _ = probeServer.Write([]byte("+$00000000#80"))
+		}
+	}()
+
+	var out bytes.Buffer
+	err := RelayGDB(context.Background(), probe, stringsNewReader("$g#67"), &out, func(string) (io.ReadWriteCloser, error) {
+		return probePort, nil
+	})
+	if err != nil {
+		t.Fatalf("RelayGDB failed: %v", err)
+	}
+	if out.String() != "+$00000000#80" {
+		t.Fatalf("expected full in-flight RSP reply, got %q", out.String())
+	}
+
+	waitForGoroutines(t, baselineG)
+}
+
+type uninterruptibleBlockingReader struct {
+	unblock <-chan struct{}
+}
+
+func (r uninterruptibleBlockingReader) Read(_ []byte) (int, error) {
+	<-r.unblock
+	return 0, io.EOF
+}
+
+func stringsNewReader(s string) io.Reader {
+	return bytes.NewBufferString(s)
+}
+
+func TestRelayGDBUninterruptibleStdinDoesNotBlockLockReleaseOnDisconnect(t *testing.T) {
+	t.Setenv("PU_LOCK_DIR", filepath.Join(t.TempDir(), "locks"))
+
+	probe := usbprobe.ProbeDevice{
+		Serial:  "E660GDBSTDIN0006",
+		VID:     0x2E8A,
+		PID:     0x1050,
+		GDBPort: "/dev/ttyACM0",
+	}
+
+	unblockStdin := make(chan struct{})
+	defer close(unblockStdin)
+
+	probeServer, probePort := net.Pipe()
+	opened := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- RelayGDB(context.Background(), probe, uninterruptibleBlockingReader{unblock: unblockStdin}, io.Discard, func(string) (io.ReadWriteCloser, error) {
+			close(opened)
+			return probePort, nil
+		})
+	}()
+
+	<-opened
+	// Disconnect probe while uninterruptible stdin reader (simulating os.Stdin) remains blocked.
+	_ = probeServer.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected error on probe disconnect: %v", err)
+		}
+	case <-time.After(400 * time.Millisecond):
+		t.Fatal("RelayGDB blocked waiting on uninterruptible stdin Read instead of releasing lock promptly")
+	}
+
+	lk, err := usbprobe.AcquireSessionLock(probe.Serial)
+	if err != nil {
+		t.Fatalf("expected probe session lock to be released immediately, got %v", err)
+	}
+	_ = lk.Close()
 }

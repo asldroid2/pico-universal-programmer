@@ -267,6 +267,24 @@ func formatGDBSerialTarget(port string) string {
 	return p
 }
 
+func formatOpenOCDBracePath(p string) (string, error) {
+	slashed := filepath.ToSlash(p)
+	if strings.ContainsAny(slashed, "{}\r\n\x00") {
+		return "", fmt.Errorf("uploader: path %q contains characters unsafe for OpenOCD JimTcl braces", p)
+	}
+	return "{" + slashed + "}", nil
+}
+
+func formatGDBQuotedPath(p string) (string, error) {
+	slashed := filepath.ToSlash(p)
+	if strings.ContainsAny(slashed, "\r\n\x00") {
+		return "", fmt.Errorf("uploader: path %q contains control characters unsafe for GDB", p)
+	}
+	escaped := strings.ReplaceAll(slashed, `\`, `\\`)
+	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
+	return `"` + escaped + `"`, nil
+}
+
 // UploadAtomic locks probe.Serial across processes, snapshots all firmware artifacts
 // into a private 0700 temp directory (guaranteed cleanup via defer), validates sector
 // safety, flashes, verifies readback, and resets the target.
@@ -289,6 +307,15 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 	}
 	if hasSegments && family != "esp32" && family != "esp32s3" {
 		return fmt.Errorf("uploader: multi-segment flashing is only supported on esp32/esp32s3 (got %s)", family)
+	}
+	if (family == "esp32" || family == "esp32s3") && !hasSegments {
+		isBin := strings.EqualFold(filepath.Ext(req.FilePath), ".bin")
+		if !isBin && req.BaseAddr == 0 {
+			return fmt.Errorf(
+				"uploader: %s single-ELF --file upload is unsupported without flash segments; pass --segment 0x1000:bootloader.bin --segment 0x8000:partitions.bin --segment 0x10000:app.bin (or a raw .bin with --addr)",
+				family,
+			)
+		}
 	}
 
 	lk, err := usbprobe.AcquireSessionLock(probe.Serial)
@@ -363,7 +390,10 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			}
 		}
 
-		snapSlash := filepath.ToSlash(snappedFile)
+		quotedSnap, qErr := formatGDBQuotedPath(snappedFile)
+		if qErr != nil {
+			return qErr
+		}
 		spec := CommandSpec{
 			Name: gdbBin,
 			Args: []string{
@@ -372,7 +402,7 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 				"-ex", "set pagination off",
 				"-ex", "set confirm off",
 				"-ex", "set breakpoint auto-hw off",
-				"-ex", "file " + snapSlash,
+				"-ex", "file " + quotedSnap,
 				"-ex", "target extended-remote " + formatGDBSerialTarget(probe.GDBPort),
 				"-ex", "monitor reset halt",
 				"-ex", "load",
@@ -382,12 +412,31 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			},
 		}
 		runErr := runner.Run(spec, outWriter, errWriter)
-		combinedLower := strings.ToLower(capOut.String() + "\n" + capErr.String())
+		combined := capOut.String() + "\n" + capErr.String()
+		combinedLower := strings.ToLower(combined)
 		if runErr != nil {
-			return fmt.Errorf("uploader: CH32V003 GDB upload failed: %w (%s)", runErr, strings.TrimSpace(capErr.String()))
+			return fmt.Errorf("uploader: CH32V003 GDB upload failed: %w (%s)", runErr, strings.TrimSpace(combined))
 		}
-		if strings.Contains(combinedLower, "mis-matched") || strings.Contains(combinedLower, "mismatched") {
-			return errors.New("uploader: CH32V003 mandatory compare-sections readback verification failed (MIS-MATCHED)")
+		gdbErrMarkers := []string{
+			"mis-matched",
+			"mismatched",
+			"error:",
+			"load failed",
+			"no such file or directory",
+			"remote failure reply",
+			"cannot access memory",
+			"could not open",
+			"remote connection closed",
+			"ignoring packet error",
+			"permission denied",
+		}
+		for _, marker := range gdbErrMarkers {
+			if strings.Contains(combinedLower, marker) {
+				return fmt.Errorf("uploader: CH32V003 GDB batch reported failure (%q): %s", marker, strings.TrimSpace(combined))
+			}
+		}
+		if !strings.Contains(combinedLower, "matched") {
+			return errors.New("uploader: CH32V003 mandatory compare-sections did not confirm 'matched' readback")
 		}
 		return nil
 	}
@@ -407,8 +456,11 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			"rp2350":  "target/rp2350.cfg",
 		}[family]
 
-		snapSlash := filepath.ToSlash(snappedFile)
-		progCmd := fmt.Sprintf(`program "%s" verify reset exit`, snapSlash)
+		bracedSnap, bErr := formatOpenOCDBracePath(snappedFile)
+		if bErr != nil {
+			return bErr
+		}
+		progCmd := fmt.Sprintf(`program %s verify reset exit`, bracedSnap)
 		isBin := strings.EqualFold(filepath.Ext(snappedFile), ".bin")
 		baseAddr := req.BaseAddr
 		if isBin && baseAddr == 0 {
@@ -419,13 +471,14 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			}
 		}
 		if baseAddr != 0 {
-			progCmd = fmt.Sprintf(`program "%s" 0x%08x verify reset exit`, snapSlash, baseAddr)
+			progCmd = fmt.Sprintf(`program %s 0x%08x verify reset exit`, bracedSnap, baseAddr)
 		}
 
 		args = []string{
 			"-f", "interface/cmsis-dap.cfg",
 			"-c", "adapter serial " + probe.Serial,
 			"-c", "transport select swd",
+			"-c", "adapter speed 4000",
 			"-f", targetCfg,
 			"-c", progCmd,
 		}
@@ -454,6 +507,7 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 				"-f", "interface/cmsis-dap.cfg",
 				"-c", "adapter serial " + probe.Serial,
 				"-c", "transport select jtag",
+				"-c", "adapter speed 5000",
 				"-f", "target/esp32s3.cfg",
 			}
 		}
@@ -462,21 +516,24 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			cmds := make([]string, 0, len(snappedSegs)+3)
 			cmds = append(cmds, "init", "reset halt")
 			for _, seg := range snappedSegs {
-				cmds = append(cmds, fmt.Sprintf(`program_esp "%s" 0x%08x verify`, filepath.ToSlash(seg.Path), seg.Addr))
+				bracedSeg, bErr := formatOpenOCDBracePath(seg.Path)
+				if bErr != nil {
+					return bErr
+				}
+				cmds = append(cmds, fmt.Sprintf(`program_esp %s 0x%08x verify`, bracedSeg, seg.Addr))
 			}
 			cmds = append(cmds, "reset run", "exit")
 			args = append(args, "-c", strings.Join(cmds, "; "))
 		} else {
-			snapSlash := filepath.ToSlash(snappedFile)
-			if strings.EqualFold(filepath.Ext(snappedFile), ".bin") || req.BaseAddr != 0 {
-				addr := req.BaseAddr
-				if addr == 0 {
-					addr = 0x10000
-				}
-				args = append(args, "-c", fmt.Sprintf(`program_esp "%s" 0x%08x verify reset exit`, snapSlash, addr))
-			} else {
-				args = append(args, "-c", fmt.Sprintf(`program "%s" verify reset exit`, snapSlash))
+			bracedSnap, bErr := formatOpenOCDBracePath(snappedFile)
+			if bErr != nil {
+				return bErr
 			}
+			addr := req.BaseAddr
+			if addr == 0 {
+				addr = 0x10000
+			}
+			args = append(args, "-c", fmt.Sprintf(`program_esp %s 0x%08x verify reset exit`, bracedSnap, addr))
 		}
 	}
 

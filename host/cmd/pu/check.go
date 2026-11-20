@@ -118,7 +118,11 @@ func runCheck(ctx cliContext, args []string) int {
 		return 1
 	}
 
-	report, err := puid.CheckTarget(probe, family, puidRunnerAdapter{inner: ctx.cmdRunner})
+	report, err := puid.CheckTargetWithOptions(probe, family, puid.CheckOptions{
+		Runner:          puidRunnerAdapter{inner: ctx.cmdRunner},
+		PortOpener:      ctx.portOpener,
+		CtrlTransceiver: ctx.ctrlTransceiver,
+	})
 	if err != nil {
 		fmt.Fprintf(ctx.stderr, "pu check: %v\n", err)
 		return 1

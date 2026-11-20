@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -291,6 +292,7 @@ func TestCH32PUID1QRcmdHelperAndAllErrorCodes(t *testing.T) {
 		"PUID1:ERR_DETACH_FAILED RESUMED=0 OUTEN_OFF=0",
 		"PUID1:ERR_ENGINE_BUSY",
 		"PUID1:ERR_FAULT_LATCHED",
+		"PUID1:ERR_UNEXPECTED_STATE",
 	}
 	for _, rawErr := range errCodes {
 		rep, err := ParsePUID1Response(rawErr)
@@ -301,6 +303,14 @@ func TestCH32PUID1QRcmdHelperAndAllErrorCodes(t *testing.T) {
 			t.Fatalf("expected non-ready report with diagnosis+remediation for %q, got %+v", rawErr, rep)
 		}
 	}
+}
+
+func frameRSPPacket(payload string) string {
+	var csum byte
+	for i := 0; i < len(payload); i++ {
+		csum += payload[i]
+	}
+	return fmt.Sprintf("$%s#%02x", payload, csum)
 }
 
 func TestCheckTargetAcquiresLockAndInvokesTransportsOffline(t *testing.T) {
@@ -380,18 +390,71 @@ func TestCheckTargetAcquiresLockAndInvokesTransportsOffline(t *testing.T) {
 		t.Fatalf("expected staged pu-esp32.cfg temp dir to be cleaned up, statErr=%v", statErr)
 	}
 
-	// Check CH32V003 via GDB monitor puid1
+	// Check CH32V003 via raw CDC PortOpener (MUST NOT spawn riscv-none-elf-gdb!)
 	runner.ran = nil
-	runner.onRun = func(spec CommandSpec, stdout, stderr io.Writer) error {
-		fmt.Fprintln(stdout, "PUID1:OK:ID=0x00300500:FLASH_KB=16")
-		return nil
-	}
-	chRep, err := CheckTarget(probe, "ch32v003", runner)
+	delete(runner.bins, "riscv-none-elf-gdb")
+
+	// 1. Standard RSP $O<hex>#.. + $OK#9a stream over net.Pipe()
+	srv1, cli1 := net.Pipe()
+	go func() {
+		defer srv1.Close()
+		wantPkt := BuildGDBQRcmdPacket("puid1")
+		got := make([]byte, len(wantPkt))
+		if _, rErr := io.ReadFull(srv1, got); rErr != nil || string(got) != wantPkt {
+			return
+		}
+		hexLine := strings.ToUpper(hex.EncodeToString([]byte("PUID1:OK CHIP_ID=0x00300500 FLASH_KB=16 FLASH_WRITES=2 RESUMED=1 OUTEN_OFF=1\n")))
+		_, _ = io.WriteString(srv1, "+"+frameRSPPacket("O"+hexLine)+frameRSPPacket("OK"))
+	}()
+	chRep, err := CheckTargetWithOptions(probe, "ch32v003", CheckOptions{
+		Runner: runner,
+		PortOpener: func(portPath string) (io.ReadWriteCloser, error) {
+			if portPath != probe.GDBPort {
+				return nil, fmt.Errorf("unexpected port %q", portPath)
+			}
+			return cli1, nil
+		},
+	})
 	if err != nil || !chRep.Ready || chRep.FlashKB != 16 || chRep.ChipID != "0x00300500" {
-		t.Fatalf("CheckTarget ch32v003 failed: rep=%+v err=%v", chRep, err)
+		t.Fatalf("CheckTargetWithOptions ch32v003 ($O+$OK) failed: rep=%+v err=%v", chRep, err)
 	}
-	if !strings.Contains(strings.Join(runner.ran[0].Args, " "), "monitor puid1") {
-		t.Fatalf("expected 'monitor puid1' in GDB args: %v", runner.ran[0].Args)
+	if len(runner.ran) != 0 {
+		t.Fatalf("expected ZERO external GDB invocations for ch32v003 check, got %d: %+v", len(runner.ran), runner.ran)
+	}
+
+	// 2. Direct firmware encode_ascii_as_hex_packet ($<hex>#.. without trailing $OK, port stays open)
+	srv2, cli2 := net.Pipe()
+	defer srv2.Close()
+	go func() {
+		wantPkt := BuildGDBQRcmdPacket("puid1")
+		got := make([]byte, len(wantPkt))
+		if _, rErr := io.ReadFull(srv2, got); rErr != nil {
+			return
+		}
+		hexLine := strings.ToUpper(hex.EncodeToString([]byte("PUID1:ERR_ALREADY_HALTED\n")))
+		_, _ = io.WriteString(srv2, "+"+frameRSPPacket(hexLine))
+	}()
+	haltedRep, err := CheckTargetWithOptions(probe, "ch32v003", CheckOptions{
+		Runner:     runner,
+		PortOpener: func(string) (io.ReadWriteCloser, error) { return cli2, nil },
+	})
+	if err != nil || haltedRep.Ready || haltedRep.Verdict != "ERR_ALREADY_HALTED" {
+		t.Fatalf("expected ERR_ALREADY_HALTED from raw firmware RSP packet, got rep=%+v err=%v", haltedRep, err)
+	}
+
+	// 3. RSP error reply ($E01#a6) must surface a clean error
+	srv3, cli3 := net.Pipe()
+	go func() {
+		defer srv3.Close()
+		buf := make([]byte, 32)
+		_, _ = srv3.Read(buf)
+		_, _ = io.WriteString(srv3, "+"+frameRSPPacket("E01"))
+	}()
+	if _, err := CheckTargetWithOptions(probe, "ch32v003", CheckOptions{
+		Runner:     runner,
+		PortOpener: func(string) (io.ReadWriteCloser, error) { return cli3, nil },
+	}); err == nil {
+		t.Fatal("expected error when probe replies $E01 to qRcmd puid1")
 	}
 
 	// CoreSight ROM table PIDR4/PIDR1/PIDR2 -> JEP106 0x7A3 (GD32F103) + VTREF out-of-range check
@@ -429,5 +492,77 @@ func TestCheckTargetAcquiresLockAndInvokesTransportsOffline(t *testing.T) {
 	echoRep, err := ClassifyTarget(echoObs)
 	if err != nil || !echoRep.IsClone {
 		t.Fatalf("expected CS32 clone detection from UNEXPECTED line, got %+v err=%v", echoRep, err)
+	}
+}
+
+func TestCheckTargetIF5PreFlightDetectsBusyFaultAndPopulatesTelemetry(t *testing.T) {
+	t.Setenv("PU_LOCK_DIR", filepath.Join(t.TempDir(), "locks"))
+
+	probe := usbprobe.ProbeDevice{
+		Serial:   "E660IF5CHECK0001",
+		VID:      0x2E8A,
+		PID:      0x1050,
+		DAPPath:  "/dev/bus/usb/001/020",
+		CtrlPath: "/dev/bus/usb/001/020",
+	}
+
+	runner := &fakeRunner{
+		bins: map[string]string{"openocd": "/usr/bin/openocd"},
+	}
+
+	// 1. IF 5 reports PU_ENGINE_SWD active -> short-circuits with ERR_ENGINE_BUSY BEFORE OpenOCD runs!
+	busyRep, err := CheckTargetWithOptions(probe, "stm32f1", CheckOptions{
+		Runner: runner,
+		CtrlTransceiver: func(_ usbprobe.ProbeDevice, req []byte) ([]byte, error) {
+			if req[0] == usbprobe.CtrlCmdGetInfo {
+				return []byte{0x01, 0x00, 1, 0, 0, 1, 0x07, usbprobe.EngineSWD, 0, 0, 0, 0, 0}, nil
+			}
+			return []byte{0x02, 0x00, 0xE4, 0x0C, 0x10, 0x00, 1, 0, 1, 0, 0, 0, 0}, nil
+		},
+	})
+	if err != nil || busyRep.Ready || busyRep.Verdict != "ERR_ENGINE_BUSY" {
+		t.Fatalf("expected pre-flight ERR_ENGINE_BUSY, got rep=%+v err=%v", busyRep, err)
+	}
+	if len(runner.ran) != 0 {
+		t.Fatalf("OpenOCD must NOT run when IF 5 reports engine busy; ran=%d", len(runner.ran))
+	}
+
+	// 2. IF 5 reports PU_ENGINE_FAULT / overcurrent -> short-circuits with ERR_FAULT_LATCHED BEFORE OpenOCD runs!
+	faultRep, err := CheckTargetWithOptions(probe, "rp2040", CheckOptions{
+		Runner: runner,
+		CtrlTransceiver: func(_ usbprobe.ProbeDevice, req []byte) ([]byte, error) {
+			if req[0] == usbprobe.CtrlCmdGetInfo {
+				return []byte{0x01, 0x00, 1, 0, 0, 1, 0x07, usbprobe.EngineFault, 0, 0x01, 0, 0, 0}, nil
+			}
+			return []byte{0x02, 0x00, 0x00, 0x00, 0x20, 0x02, 0, 1, 1, 0, 0, 0, 0}, nil
+		},
+	})
+	if err != nil || faultRep.Ready || faultRep.Verdict != "ERR_FAULT_LATCHED" {
+		t.Fatalf("expected pre-flight ERR_FAULT_LATCHED, got rep=%+v err=%v", faultRep, err)
+	}
+	if len(runner.ran) != 0 {
+		t.Fatalf("OpenOCD must NOT run when IF 5 reports latched fault; ran=%d", len(runner.ran))
+	}
+
+	// 3. Healthy IF 5 populates live VTrefMV & ITargMA, and esp32s3 injects explicit adapter speed 5000!
+	runner.onRun = func(spec CommandSpec, stdout, stderr io.Writer) error {
+		fmt.Fprintln(stderr, "Info : JTAG tap: esp32s3.cpu0 tap/device found: 0x120034e5")
+		return nil
+	}
+	s3Rep, err := CheckTargetWithOptions(probe, "esp32s3", CheckOptions{
+		Runner: runner,
+		CtrlTransceiver: func(_ usbprobe.ProbeDevice, req []byte) ([]byte, error) {
+			if req[0] == usbprobe.CtrlCmdGetInfo {
+				return []byte{0x01, 0x00, 1, 0, 0, 1, 0x07, usbprobe.EngineIdle, 0, 0, 0, 0, 0}, nil
+			}
+			// VTrefMV = 3315 (0x0CF3), ITargMA = 38 (0x0026)
+			return []byte{0x02, 0x00, 0xF3, 0x0C, 0x26, 0x00, 1, 0, 1, 0, 0, 0, 0}, nil
+		},
+	})
+	if err != nil || !s3Rep.Ready || s3Rep.VTrefMV != 3315 || s3Rep.ITargMA != 38 {
+		t.Fatalf("expected live VTrefMV=3315 and ITargMA=38 on esp32s3 report, got rep=%+v err=%v", s3Rep, err)
+	}
+	if len(runner.ran) != 1 || !strings.Contains(strings.Join(runner.ran[0].Args, " | "), "adapter speed 5000") {
+		t.Fatalf("expected explicit 'adapter speed 5000' in esp32s3 OpenOCD check args: %+v", runner.ran)
 	}
 }

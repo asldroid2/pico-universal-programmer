@@ -19,9 +19,14 @@ import (
 // PortOpener opens a probe's bidirectional GDB CDC serial transport.
 type PortOpener func(portPath string) (io.ReadWriteCloser, error)
 
+// OpenSerialPort opens the OS serial/CDC device in raw, non-blocking / bounded binary mode.
+func OpenSerialPort(portPath string) (io.ReadWriteCloser, error) {
+	return openOSSerialPort(portPath)
+}
+
 // DefaultPortOpener opens the OS serial/CDC device in raw transparent binary mode.
 func DefaultPortOpener(portPath string) (io.ReadWriteCloser, error) {
-	return openOSSerialPort(portPath)
+	return OpenSerialPort(portPath)
 }
 
 func normalizeLoopbackAddr(raw string) (string, error) {
@@ -164,22 +169,31 @@ func ServeGDBTCP(ctx context.Context, listenAddr string, probe usbprobe.ProbeDev
 	return relayStreams(ctx, conn, conn, port)
 }
 
-func interruptBlockingIO(in io.Reader, out io.Writer) {
+const (
+	stdioEOFIdleDrain = 80 * time.Millisecond
+	stdioEOFMaxDrain  = 500 * time.Millisecond
+)
+
+func interruptBlockingIO(in io.Reader, out io.Writer) bool {
 	now := time.Now()
 	unblockedIn := false
-	if rd, ok := in.(interface{ SetReadDeadline(time.Time) error }); ok {
-		if err := rd.SetReadDeadline(now); err == nil {
-			unblockedIn = true
+	if in != os.Stdin {
+		if rd, ok := in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			if err := rd.SetReadDeadline(now); err == nil {
+				unblockedIn = true
+			}
+		}
+		if !unblockedIn {
+			if c, ok := in.(io.Closer); ok {
+				_ = c.Close()
+				unblockedIn = true
+			}
 		}
 	}
-	if !unblockedIn {
-		if c, ok := in.(io.Closer); ok && in != os.Stdin {
-			_ = c.Close()
-		}
-	}
-	if wd, ok := out.(interface{ SetWriteDeadline(time.Time) error }); ok {
+	if wd, ok := out.(interface{ SetWriteDeadline(time.Time) error }); ok && out != os.Stdout && out != os.Stderr {
 		_ = wd.SetWriteDeadline(now)
 	}
+	return unblockedIn
 }
 
 func isBenignShutdownErr(err error) bool {
@@ -190,14 +204,44 @@ func isBenignShutdownErr(err error) bool {
 	return strings.Contains(msg, "use of closed") || strings.Contains(msg, "closed pipe") || strings.Contains(msg, "file already closed")
 }
 
+func drainPortAfterInputEOF(ctx context.Context, portDone <-chan struct{}, lastRxNano *atomic.Int64) {
+	start := time.Now()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-portDone:
+			return
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if now.Sub(start) >= stdioEOFMaxDrain {
+				return
+			}
+			lastActivity := start
+			if rxNano := lastRxNano.Load(); rxNano > 0 {
+				if rxTime := time.Unix(0, rxNano); rxTime.After(lastActivity) {
+					lastActivity = rxTime
+				}
+			}
+			if now.Sub(lastActivity) >= stdioEOFIdleDrain {
+				return
+			}
+		}
+	}
+}
+
 func relayStreams(ctx context.Context, in io.Reader, out io.Writer, port io.ReadWriteCloser) error {
 	var shuttingDown atomic.Bool
+	var unblockedIn atomic.Bool
+	var lastPortRxNano atomic.Int64
 	var shutdownOnce sync.Once
 	shutdown := func() {
 		shutdownOnce.Do(func() {
 			shuttingDown.Store(true)
 			_ = port.Close()
-			interruptBlockingIO(in, out)
+			unblockedIn.Store(interruptBlockingIO(in, out))
 		})
 	}
 
@@ -226,15 +270,19 @@ func relayStreams(ctx context.Context, in io.Reader, out io.Writer, port io.Read
 		errMu.Unlock()
 	}
 
-	var copyWG sync.WaitGroup
-	copyWG.Add(2)
+	inDone := make(chan struct{})
+	portDone := make(chan struct{})
 
 	// GDB -> Probe CDC
 	go func() {
-		defer copyWG.Done()
+		defer close(inDone)
 		buf := make([]byte, 4096)
+		cleanInputEOF := false
 		for {
 			n, rErr := in.Read(buf)
+			if shuttingDown.Load() {
+				break
+			}
 			if n > 0 {
 				if _, wErr := port.Write(buf[:n]); wErr != nil {
 					if !shuttingDown.Load() && !isBenignShutdownErr(wErr) {
@@ -244,22 +292,28 @@ func relayStreams(ctx context.Context, in io.Reader, out io.Writer, port io.Read
 				}
 			}
 			if rErr != nil {
-				if !shuttingDown.Load() && !isBenignShutdownErr(rErr) {
+				if errors.Is(rErr, io.EOF) && !shuttingDown.Load() && ctx.Err() == nil {
+					cleanInputEOF = true
+				} else if !shuttingDown.Load() && !isBenignShutdownErr(rErr) {
 					recordErr(fmt.Errorf("gdbpipe: read GDB input: %w", rErr))
 				}
 				break
 			}
+		}
+		if cleanInputEOF {
+			drainPortAfterInputEOF(ctx, portDone, &lastPortRxNano)
 		}
 		shutdown()
 	}()
 
 	// Probe CDC -> GDB
 	go func() {
-		defer copyWG.Done()
+		defer close(portDone)
 		buf := make([]byte, 4096)
 		for {
 			n, rErr := port.Read(buf)
 			if n > 0 {
+				lastPortRxNano.Store(time.Now().UnixNano())
 				if _, wErr := out.Write(buf[:n]); wErr != nil {
 					if !shuttingDown.Load() && !isBenignShutdownErr(wErr) {
 						recordErr(fmt.Errorf("gdbpipe: write GDB output: %w", wErr))
@@ -277,8 +331,23 @@ func relayStreams(ctx context.Context, in io.Reader, out io.Writer, port io.Read
 		shutdown()
 	}()
 
-	copyWG.Wait()
+	// Always wait for port -> out cleanup so port is closed and out writes have completely stopped.
+	<-portDone
 	shutdown()
+
+	// Only wait on in -> port when input could be interrupted; never block forever on os.Stdin.Read.
+	if unblockedIn.Load() {
+		select {
+		case <-inDone:
+		case <-time.After(250 * time.Millisecond):
+		}
+	} else {
+		select {
+		case <-inDone:
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
 	close(stopWatch)
 	watchWG.Wait()
 

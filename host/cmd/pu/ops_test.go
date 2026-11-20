@@ -70,11 +70,21 @@ func TestPUCheckSubcommandJSONHumanAndMultiProbeDisambiguation(t *testing.T) {
 		t.Fatalf("unexpected CheckReport: %+v", rep)
 	}
 
-	// 2. CH32V003 ERR_NO_REPLY human output -> exit 1, prints all 5 causes
-	runner.onRun = func(cmd commandSpec, stdout, stderr io.Writer) error {
-		fmt.Fprintln(stdout, "PUID1:ERR_NO_REPLY")
-		return nil
-	}
+	// 2. CH32V003 ERR_NO_REPLY over raw CDC RSP qRcmd puid1 -> exit 1, prints all 5 causes
+	ch32Server, ch32Port := net.Pipe()
+	go func() {
+		defer ch32Server.Close()
+		buf := make([]byte, 64)
+		_, _ = ch32Server.Read(buf)
+		// Send $O<hex("PUID1:ERR_NO_REPLY\n")>#csum + $OK#9a
+		msg := "PUID1:ERR_NO_REPLY\n"
+		payload := fmt.Sprintf("O%x", msg)
+		var sum byte
+		for i := 0; i < len(payload); i++ {
+			sum += payload[i]
+		}
+		_, _ = fmt.Fprintf(ch32Server, "+$%s#%02x$OK#9a", payload, sum)
+	}()
 	out.Reset()
 	errBuf.Reset()
 	code = runWithEnv([]string{"check", "--family", "ch32v003"}, cliEnv{
@@ -82,6 +92,19 @@ func TestPUCheckSubcommandJSONHumanAndMultiProbeDisambiguation(t *testing.T) {
 		stderr:         &errBuf,
 		cmdRunner:      runner,
 		discoverProbes: singleFakeProbe(),
+		portOpener: func(string) (io.ReadWriteCloser, error) {
+			return ch32Port, nil
+		},
+		ctrlTransceiver: func(_ usbprobe.ProbeDevice, req []byte) ([]byte, error) {
+			switch req[0] {
+			case usbprobe.CtrlCmdGetInfo:
+				return []byte{0x01, 0x00, 1, 0, 0, 1, 0x07, 0, 0, 0, 0, 0, 0}, nil
+			case usbprobe.CtrlCmdGetTelemetry:
+				return []byte{0x02, 0x00, 0xE4, 0x0C, 0x20, 0x00, 1, 0, 1, 0, 0, 0, 0}, nil
+			default:
+				return []byte{req[0], usbprobe.CtrlStatusUnsupported}, nil
+			}
+		},
 	})
 	if code == 0 {
 		t.Fatalf("expected non-zero exit code for PUID1:ERR_NO_REPLY, got 0")
@@ -304,6 +327,9 @@ func TestPURecoverCH32AndSTM32MassErase(t *testing.T) {
 	if code != 0 || len(sentCtrl) != 1 || sentCtrl[0] != 0x05 {
 		t.Fatalf("CH32 IF5 recover failed: code=%d sent=%x stderr=%s", code, sentCtrl, errBuf.String())
 	}
+	if idxUpload, idxCheck := strings.Index(out.String(), "pu upload"), strings.Index(out.String(), "pu check"); idxUpload < 0 || (idxCheck >= 0 && idxUpload > idxCheck) {
+		t.Fatalf("expected CH32 unbrick output to instruct 'pu upload' FIRST before 'pu check', got:\n%s", out.String())
+	}
 
 	// 2. CH32V003 guided fallback when probe is PU_BOARD_PICO (UNSUPPORTED = 0x02 / no VTARG switch)
 	out.Reset()
@@ -320,7 +346,7 @@ func TestPURecoverCH32AndSTM32MassErase(t *testing.T) {
 		t.Fatalf("expected guided power-cycle unbrick instructions on Pico dev profile, got code=%d out=%s", code, out.String())
 	}
 
-	// 3. STM32F1 connect_assert_srst mass erase
+	// 3. STM32F1 connect_assert_srst mass erase with reset halt between unlock and mass_erase
 	runner := &fakeCommandRunner{
 		bins: map[string]string{"openocd": "/usr/bin/openocd"},
 	}
@@ -336,8 +362,27 @@ func TestPURecoverCH32AndSTM32MassErase(t *testing.T) {
 		t.Fatalf("STM32F1 recover failed: code=%d stderr=%s", code, errBuf.String())
 	}
 	joined := strings.Join(runner.ran[0].args, " ")
-	if !strings.Contains(joined, "connect_assert_srst") || !strings.Contains(joined, "mass_erase") {
-		t.Fatalf("missing connect_assert_srst or mass_erase in STM32 recover args: %s", joined)
+	for _, want := range []string{"connect_assert_srst", "stm32f1x unlock 0; reset halt; stm32f1x mass_erase 0"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in STM32 recover args: %s", want, joined)
+		}
+	}
+
+	// 4. STM32 OpenOCD error printed to stderr/stdout with exit code 0 must still fail recover!
+	runner.onRun = func(_ commandSpec, stdout, stderr io.Writer) error {
+		fmt.Fprintln(stderr, "Error: stm32f1x unlock failed: target not halted")
+		return nil
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = runWithEnv([]string{"recover", "--family", "stm32f1"}, cliEnv{
+		stdout:         &out,
+		stderr:         &errBuf,
+		cmdRunner:      runner,
+		discoverProbes: singleFakeProbe(),
+	})
+	if code == 0 {
+		t.Fatalf("expected STM32 recover to fail on OpenOCD unlock error even with exit 0")
 	}
 }
 
@@ -345,8 +390,26 @@ func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
 	for _, family := range []string{"stm32f1", "rp2040", "esp32", "ch32v003"} {
 		t.Run(family, func(t *testing.T) {
 			projDir := t.TempDir()
+			vscodeDir := filepath.Join(projDir, ".vscode")
+			if err := os.MkdirAll(vscodeDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			// Pre-populate an existing user launch.json to verify non-destructive merge!
+			existingLaunch := `{
+  "version": "0.2.0",
+  "configurations": [
+    {"name": "User Custom Launch", "type": "cppdbg", "request": "launch"}
+  ],
+  "compounds": [{"name": "All", "configurations": ["User Custom Launch"]}]
+}
+`
+			if err := os.WriteFile(filepath.Join(vscodeDir, "launch.json"), []byte(existingLaunch), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
 			var out, errBuf bytes.Buffer
 			code := runWithEnv([]string{
+				"--pid", "0x1050",
 				"export-vscode",
 				"--family", family,
 				"--out-dir", projDir,
@@ -359,8 +422,8 @@ func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
 				t.Fatalf("export-vscode %s failed: code=%d stderr=%s", family, code, errBuf.String())
 			}
 
-			launchPath := filepath.Join(projDir, ".vscode", "launch.json")
-			ocdPath := filepath.Join(projDir, ".vscode", "pico-universal-openocd.cfg")
+			launchPath := filepath.Join(vscodeDir, "launch.json")
+			ocdPath := filepath.Join(vscodeDir, "pico-universal-openocd.cfg")
 
 			launchRaw, err := os.ReadFile(launchPath)
 			if err != nil {
@@ -377,19 +440,36 @@ func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
 			var parsed struct {
 				Version        string           `json:"version"`
 				Configurations []map[string]any `json:"configurations"`
+				Compounds      []map[string]any `json:"compounds"`
 			}
 			if err := json.Unmarshal(launchRaw, &parsed); err != nil {
 				t.Fatalf("invalid launch.json for %s: %v\n%s", family, err, string(launchRaw))
 			}
-			if parsed.Version != "0.2.0" || len(parsed.Configurations) == 0 {
-				t.Fatalf("unexpected launch.json content for %s: %+v", family, parsed)
+			if parsed.Version != "0.2.0" || len(parsed.Configurations) != 2 || len(parsed.Compounds) != 1 {
+				t.Fatalf("expected non-destructive merge preserving user config & compounds for %s: %+v", family, parsed)
+			}
+			if parsed.Configurations[0]["name"] != "User Custom Launch" {
+				t.Fatalf("existing user config was not preserved: %+v", parsed.Configurations[0])
 			}
 
-			if family == "esp32" && !strings.Contains(string(ocdRaw), "ESP32_FLASH_VOLTAGE 3.3") {
-				t.Fatalf("expected embedded Zbit/ESP32 OpenOCD config in %s:\n%s", ocdPath, string(ocdRaw))
+			puCfg := parsed.Configurations[1]
+			if _, hasInvalid := puCfg["puStdioAlternative"]; hasInvalid {
+				t.Fatalf("launch.json must not contain non-standard puStdioAlternative key:\n%s", string(launchRaw))
 			}
-			if family == "ch32v003" && !strings.Contains(string(launchRaw), "set breakpoint auto-hw off") {
-				t.Fatalf("expected 'set breakpoint auto-hw off' in CH32 launch.json:\n%s", string(launchRaw))
+
+			if family == "esp32" {
+				if !strings.Contains(string(ocdRaw), "ESP32_FLASH_VOLTAGE 3.3") || !strings.Contains(string(ocdRaw), "cmsis_dap_vid_pid 0x2e8a 0x1050") {
+					t.Fatalf("expected embedded Zbit/ESP32 OpenOCD config and PID in %s:\n%s", ocdPath, string(ocdRaw))
+				}
+			}
+			if family == "ch32v003" {
+				gdbTarget, _ := puCfg["gdbTarget"].(string)
+				if !strings.HasPrefix(gdbTarget, "| ") || !strings.Contains(gdbTarget, "gdb-pipe --family ch32v003") || !strings.Contains(gdbTarget, "--pid 0x1050") {
+					t.Fatalf("expected stdio pipe gdbTarget with --pid in CH32 launch.json, got %q", gdbTarget)
+				}
+				if !strings.Contains(string(launchRaw), "set breakpoint auto-hw off") {
+					t.Fatalf("expected 'set breakpoint auto-hw off' in CH32 launch.json:\n%s", string(launchRaw))
+				}
 			}
 		})
 	}
