@@ -1,0 +1,222 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/usbprobe"
+)
+
+var version = "0.1.0"
+
+type cliContext struct {
+	stdout    io.Writer
+	stderr    io.Writer
+	getenv    func(string) string
+	globalPID string
+}
+
+type subcommandFunc func(ctx cliContext, args []string) int
+
+// dispatchHooks provides clean extension points for Task 8 (check, upload, gdb-pipe,
+// recover, export-vscode) and Tasks 11/12 (factory-qc, bench).
+var dispatchHooks = map[string]subcommandFunc{
+	"check":         stubSubcommand("check", "Task 8"),
+	"upload":        stubSubcommand("upload", "Task 8"),
+	"gdb-pipe":      stubSubcommand("gdb-pipe", "Task 8"),
+	"recover":       stubSubcommand("recover", "Task 8"),
+	"export-vscode": stubSubcommand("export-vscode", "Task 8"),
+	"factory-qc":    stubSubcommand("factory-qc", "Task 11"),
+	"bench":         stubSubcommand("bench", "Task 12"),
+}
+
+func stubSubcommand(name, phase string) subcommandFunc {
+	return func(ctx cliContext, _ []string) int {
+		fmt.Fprintf(ctx.stderr, "pu %s: not yet implemented (%s)\n", name, phase)
+		return 2
+	}
+}
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr, os.Getenv))
+}
+
+func run(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+
+	fs := flag.NewFlagSet("pu", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	pidFlag := fs.String("pid", "", "Approved USB PID hex (overrides PU_USB_PID; 0x0000 matches 'Pico Universal*' on 0x2E8A)")
+	verFlag := fs.Bool("version", false, "Print pu version and exit")
+	fs.Usage = func() {
+		printUsage(stderr)
+	}
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+
+	if *verFlag {
+		fmt.Fprintf(stdout, "pu version %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		return 0
+	}
+
+	rest := fs.Args()
+	if len(rest) == 0 {
+		printUsage(stderr)
+		return 2
+	}
+
+	ctx := cliContext{
+		stdout:    stdout,
+		stderr:    stderr,
+		getenv:    getenv,
+		globalPID: *pidFlag,
+	}
+
+	sub := rest[0]
+	subArgs := rest[1:]
+
+	switch sub {
+	case "version":
+		fmt.Fprintf(stdout, "pu version %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+		return 0
+	case "help", "-h", "--help":
+		printUsage(stdout)
+		return 0
+	case "setup":
+		return runSetup(ctx, subArgs)
+	case "list":
+		return runList(ctx, subArgs)
+	default:
+		if handler, ok := dispatchHooks[sub]; ok {
+			return handler(ctx, subArgs)
+		}
+		fmt.Fprintf(stderr, "pu: unknown subcommand %q\n\n", sub)
+		printUsage(stderr)
+		return 2
+	}
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "Usage: pu [-pid HEX] <subcommand> [options]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Subcommands:")
+	fmt.Fprintln(w, "  setup          Install/verify/uninstall Arduino IDE 2 profiles and USB rules")
+	fmt.Fprintln(w, "  list           Discover connected Pico Universal composite USB probes")
+	fmt.Fprintln(w, "  check          Non-destructive target MCU & probe pre-flight check")
+	fmt.Fprintln(w, "  upload         Atomic firmware upload with readback verification")
+	fmt.Fprintln(w, "  gdb-pipe       Cross-platform GDB RSP relay with probe session locking")
+	fmt.Fprintln(w, "  recover        Guided CH32V003 power-cycle unbrick / STM32 recovery")
+	fmt.Fprintln(w, "  export-vscode  Generate VS Code launch.json and OpenOCD debug configs")
+	fmt.Fprintln(w, "  factory-qc     Automated bed-of-nails factory QC runner")
+	fmt.Fprintln(w, "  bench          Automated E1-E6 benchmark suite")
+	fmt.Fprintln(w, "  version        Print pu version")
+}
+
+// ParseHexUint16 parses a 16-bit hexadecimal identifier such as "0x1050", "1050", or "0x0000".
+func ParseHexUint16(raw string) (uint16, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, errors.New("empty hex uint16 value")
+	}
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = s[2:]
+	}
+	s = strings.TrimSuffix(strings.TrimSuffix(s, "u"), "U")
+	if len(s) == 0 || len(s) > 4 {
+		return 0, fmt.Errorf("invalid 16-bit hex value %q", raw)
+	}
+	v, err := strconv.ParseUint(s, 16, 16)
+	if err != nil {
+		return 0, fmt.Errorf("invalid 16-bit hex value %q: %w", raw, err)
+	}
+	return uint16(v), nil
+}
+
+// ResolveUSBPID resolves the USB Product ID from an explicit CLI flag, falling back to
+// PU_USB_PID in the environment, or 0x0000 (wildcard "Pico Universal*" on VID 0x2E8A).
+func ResolveUSBPID(flagVal string, getenv func(string) string) (uint16, error) {
+	if strings.TrimSpace(flagVal) != "" {
+		return ParseHexUint16(flagVal)
+	}
+	if getenv != nil {
+		if env := strings.TrimSpace(getenv("PU_USB_PID")); env != "" {
+			return ParseHexUint16(env)
+		}
+	}
+	return usbprobe.DefaultPID, nil
+}
+
+func runList(ctx cliContext, args []string) int {
+	fs := flag.NewFlagSet("pu list", flag.ContinueOnError)
+	fs.SetOutput(ctx.stderr)
+	serialFlag := fs.String("serial", "", "Filter by probe hardware serial number")
+	vidFlag := fs.String("vid", "0x2E8A", "USB Vendor ID in hex")
+	pidFlag := fs.String("pid", "", "USB Product ID in hex (overrides PU_USB_PID)")
+	jsonFlag := fs.Bool("json", false, "Emit discovered probes as JSON")
+
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+
+	vid, err := ParseHexUint16(*vidFlag)
+	if err != nil {
+		fmt.Fprintf(ctx.stderr, "pu list: invalid --vid: %v\n", err)
+		return 2
+	}
+
+	effectivePIDFlag := *pidFlag
+	if effectivePIDFlag == "" {
+		effectivePIDFlag = ctx.globalPID
+	}
+	pid, err := ResolveUSBPID(effectivePIDFlag, ctx.getenv)
+	if err != nil {
+		fmt.Fprintf(ctx.stderr, "pu list: invalid PID: %v\n", err)
+		return 2
+	}
+
+	probes, err := usbprobe.DiscoverProbes(*serialFlag, vid, pid)
+	if err != nil {
+		fmt.Fprintf(ctx.stderr, "pu list: discovery failed: %v\n", err)
+		return 1
+	}
+
+	if *jsonFlag {
+		if probes == nil {
+			probes = []usbprobe.ProbeDevice{}
+		}
+		enc := json.NewEncoder(ctx.stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(probes); err != nil {
+			fmt.Fprintf(ctx.stderr, "pu list: encode json: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	if len(probes) == 0 {
+		fmt.Fprintln(ctx.stdout, "No Pico Universal probes detected.")
+		return 0
+	}
+	for _, p := range probes {
+		fmt.Fprintf(ctx.stdout, "%s\t%04x:%04x\tGDB=%s\tUART=%s\tDAP=%s\n",
+			p.Serial, p.VID, p.PID, p.GDBPort, p.UARTPort, p.DAPPath)
+	}
+	return 0
+}
