@@ -88,7 +88,7 @@ var dispatchHooks = map[string]subcommandFunc{
 	"gdb-pipe":      runGDBPipe,
 	"recover":       runRecover,
 	"export-vscode": runExportVSCode,
-	"factory-qc":    stubSubcommand("factory-qc", "Task 11"),
+	"factory-qc":    runFactoryQC,
 	"bench":         stubSubcommand("bench", "Task 12"),
 }
 

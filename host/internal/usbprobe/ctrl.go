@@ -37,6 +37,13 @@ const (
 	CapVTargSwitch  uint8 = 1 << 1
 	CapADCTelemetry uint8 = 1 << 2
 
+	// Self-test bitmask matching PU_SELFTEST_* in firmware/control_telemetry.h.
+	SelfTestEngineOK  uint32 = 1 << 0
+	SelfTestJournalOK uint32 = 1 << 1
+	SelfTestADCRailOK uint32 = 1 << 2
+	SelfTestNoFaultOK uint32 = 1 << 3
+	SelfTestAllOK     uint32 = SelfTestEngineOK | SelfTestJournalOK | SelfTestADCRailOK | SelfTestNoFaultOK
+
 	// Engine arbitrator states matching pu_engine_state_t in firmware/engine_owner.h.
 	EngineIdle     uint8 = 0
 	EngineSWD      uint8 = 1
@@ -185,4 +192,71 @@ func RequestCH32Unbrick(probe ProbeDevice, tx CtrlTransceiver) (byte, error) {
 		return 0, fmt.Errorf("usbprobe: unexpected CH32_UNBRICK command echo 0x%02x", resp[0])
 	}
 	return resp[1], nil
+}
+
+// SetVTarg executes PU_CTRL_CMD_SET_VTARG (0x03) over IF 5 and returns the firmware status byte.
+func SetVTarg(probe ProbeDevice, enabled bool, tx CtrlTransceiver) (byte, error) {
+	if tx == nil {
+		tx = DefaultCtrlTransceiver
+	}
+	var flag byte
+	if enabled {
+		flag = 1
+	}
+	resp, err := tx(probe, []byte{CtrlCmdSetVTarg, flag})
+	if err != nil {
+		return 0, err
+	}
+	if len(resp) < 2 {
+		return 0, fmt.Errorf("usbprobe: truncated SET_VTARG reply (%d bytes)", len(resp))
+	}
+	if resp[0] != CtrlCmdSetVTarg {
+		return 0, fmt.Errorf("usbprobe: unexpected SET_VTARG command echo 0x%02x", resp[0])
+	}
+	if resp[1] == CtrlStatusOK && len(resp) != 3 {
+		return 0, fmt.Errorf("usbprobe: invalid SET_VTARG OK reply length %d (expected 3)", len(resp))
+	}
+	return resp[1], nil
+}
+
+// ClearFault executes PU_CTRL_CMD_CLEAR_FAULT (0x04) over IF 5 and returns the firmware status byte.
+func ClearFault(probe ProbeDevice, tx CtrlTransceiver) (byte, error) {
+	if tx == nil {
+		tx = DefaultCtrlTransceiver
+	}
+	resp, err := tx(probe, []byte{CtrlCmdClearFault})
+	if err != nil {
+		return 0, err
+	}
+	if len(resp) != 2 {
+		return 0, fmt.Errorf("usbprobe: invalid CLEAR_FAULT reply length %d (expected 2)", len(resp))
+	}
+	if resp[0] != CtrlCmdClearFault {
+		return 0, fmt.Errorf("usbprobe: unexpected CLEAR_FAULT command echo 0x%02x", resp[0])
+	}
+	return resp[1], nil
+}
+
+// RunSelfTest executes PU_CTRL_CMD_SELF_TEST (0x07) over IF 5 and decodes the 32-bit pass bitmask.
+func RunSelfTest(probe ProbeDevice, tx CtrlTransceiver) (uint32, error) {
+	if tx == nil {
+		tx = DefaultCtrlTransceiver
+	}
+	resp, err := tx(probe, []byte{CtrlCmdSelfTest})
+	if err != nil {
+		return 0, err
+	}
+	if len(resp) < 2 {
+		return 0, fmt.Errorf("usbprobe: truncated SELF_TEST reply (%d bytes)", len(resp))
+	}
+	if resp[0] != CtrlCmdSelfTest {
+		return 0, fmt.Errorf("usbprobe: unexpected SELF_TEST command echo 0x%02x", resp[0])
+	}
+	if resp[1] != CtrlStatusOK {
+		return 0, &CtrlReplyError{Cmd: CtrlCmdSelfTest, Status: resp[1]}
+	}
+	if len(resp) != 6 {
+		return 0, fmt.Errorf("usbprobe: invalid SELF_TEST reply length %d (expected 6)", len(resp))
+	}
+	return binary.LittleEndian.Uint32(resp[2:6]), nil
 }
