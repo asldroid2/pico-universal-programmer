@@ -41,12 +41,22 @@ pico_sdk_init()
 # ----------------------------------------------------------------------------
 # Target 1: Immutable A/B CRC32 Chainloader (Slot 0: 0x10000000, 60 KiB)
 # ----------------------------------------------------------------------------
-add_executable(pu_bootloader
+set(PU_BOOTLOADER_SOURCES
     bootloader/main.c
     bootloader/handover.S
     bootloader/crc32.c
     bootloader/journal.c
     bootloader/image_validator.c
+)
+
+add_executable(pu_bootloader ${PU_BOOTLOADER_SOURCES})
+
+set_source_files_properties(
+    bootloader/main.c
+    bootloader/crc32.c
+    bootloader/journal.c
+    bootloader/image_validator.c
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror"
 )
 
 target_include_directories(pu_bootloader PRIVATE
@@ -58,13 +68,6 @@ target_compile_definitions(pu_bootloader PRIVATE
     ${PU_BOARD_DEFINE}
     PU_USB_PID=${PU_USB_PID}
     PICO_FLASH_SIZE_BYTES=2097152
-)
-
-target_compile_options(pu_bootloader PRIVATE
-    -Wall
-    -Wextra
-    -Werror
-    -Wundef
 )
 
 target_link_libraries(pu_bootloader PRIVATE
@@ -85,7 +88,7 @@ pico_add_extra_outputs(pu_bootloader)
 # ----------------------------------------------------------------------------
 # Target 2: Unified Dual-Core Composite USB Firmware (Slot A / B: 960 KiB)
 # ----------------------------------------------------------------------------
-add_executable(pu_firmware
+set(PU_FIRMWARE_SOURCES
     firmware/main.cpp
     firmware/engine_owner.c
     firmware/usb_descriptors.c
@@ -96,6 +99,13 @@ add_executable(pu_firmware
     bootloader/crc32.c
     bootloader/journal.c
     bootloader/image_validator.c
+)
+
+add_executable(pu_firmware ${PU_FIRMWARE_SOURCES})
+
+set_source_files_properties(
+    ${PU_FIRMWARE_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "-Wall;-Wextra;-Werror"
 )
 
 pico_generate_pio_header(pu_firmware ${CMAKE_CURRENT_LIST_DIR}/firmware/pio/swd.pio)
@@ -113,13 +123,6 @@ target_compile_definitions(pu_firmware PRIVATE
     PU_USB_PID=${PU_USB_PID}
     PICO_FLASH_SIZE_BYTES=2097152
     CFG_TUSB_MCU=OPT_MCU_RP2040
-)
-
-target_compile_options(pu_firmware PRIVATE
-    -Wall
-    -Wextra
-    -Werror
-    -Wundef
 )
 
 target_link_libraries(pu_firmware PRIVATE

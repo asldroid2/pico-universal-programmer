@@ -30,25 +30,33 @@ function(pu_configure_flash_slot TARGET SLOT_NAME WITH_BOOT2)
         message(FATAL_ERROR "Unknown flash_layout.json partition '${SLOT_NAME}' for target ${TARGET}")
     endif()
 
-    set(BASE_LD "${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2040/memmap_default.ld")
-    if(NOT EXISTS "${BASE_LD}")
-        set(BASE_LD "${PICO_SDK_PATH}/src/rp2_common/pico_standard_link/memmap_default.ld")
-    endif()
-    if(NOT EXISTS "${BASE_LD}")
-        message(FATAL_ERROR "Cannot locate RP2040 memmap_default.ld inside PICO_SDK_PATH=${PICO_SDK_PATH}")
-    endif()
+    if(COMMAND pico_add_linker_script_override_path)
+        set(OVERRIDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/ld_override_${TARGET}_${SLOT_NAME}")
+        file(MAKE_DIRECTORY "${OVERRIDE_DIR}")
+        file(WRITE "${OVERRIDE_DIR}/memory_flash.incl"
+            "MEMORY\n{\n    FLASH(rx) : ORIGIN = ${SLOT_ORIGIN}, LENGTH = ${SLOT_LENGTH}\n}\n")
+        pico_add_linker_script_override_path(${TARGET} "${OVERRIDE_DIR}" FILES memory_flash.incl)
+    else()
+        set(BASE_LD "${PICO_SDK_PATH}/src/rp2_common/pico_crt0/rp2040/memmap_default.ld")
+        if(NOT EXISTS "${BASE_LD}")
+            set(BASE_LD "${PICO_SDK_PATH}/src/rp2_common/pico_standard_link/memmap_default.ld")
+        endif()
+        if(NOT EXISTS "${BASE_LD}")
+            message(FATAL_ERROR "Cannot locate RP2040 memmap_default.ld inside PICO_SDK_PATH=${PICO_SDK_PATH}")
+        endif()
 
-    file(READ "${BASE_LD}" LD_CONTENT)
-    string(REGEX REPLACE
-        "FLASH\\(rx\\)[ \t]*:[ \t]*ORIGIN[ \t]*=[ \t]*0x[0-9A-Fa-f]+,[ \t]*LENGTH[ \t]*=[ \t]*[0-9A-Za-z_]+"
-        "FLASH(rx) : ORIGIN = ${SLOT_ORIGIN}, LENGTH = ${SLOT_LENGTH}"
-        LD_CONTENT "${LD_CONTENT}")
-    string(REPLACE
-        "INCLUDE \"pico_flash_region.ld\""
-        "FLASH(rx) : ORIGIN = ${SLOT_ORIGIN}, LENGTH = ${SLOT_LENGTH}"
-        LD_CONTENT "${LD_CONTENT}")
+        file(READ "${BASE_LD}" LD_CONTENT)
+        string(REGEX REPLACE
+            "FLASH\\(rx\\)[ \t]*:[ \t]*ORIGIN[ \t]*=[ \t]*0x[0-9A-Fa-f]+,[ \t]*LENGTH[ \t]*=[ \t]*[0-9A-Za-z_]+"
+            "FLASH(rx) : ORIGIN = ${SLOT_ORIGIN}, LENGTH = ${SLOT_LENGTH}"
+            LD_CONTENT "${LD_CONTENT}")
+        string(REPLACE
+            "INCLUDE \"pico_flash_region.ld\""
+            "FLASH(rx) : ORIGIN = ${SLOT_ORIGIN}, LENGTH = ${SLOT_LENGTH}"
+            LD_CONTENT "${LD_CONTENT}")
 
-    set(GEN_LD "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_${SLOT_NAME}.ld")
-    file(WRITE "${GEN_LD}" "${LD_CONTENT}")
-    pico_set_linker_script(${TARGET} "${GEN_LD}")
+        set(GEN_LD "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_${SLOT_NAME}.ld")
+        file(WRITE "${GEN_LD}" "${LD_CONTENT}")
+        pico_set_linker_script(${TARGET} "${GEN_LD}")
+    endif()
 endfunction()
