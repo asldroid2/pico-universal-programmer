@@ -64,7 +64,7 @@ V1_TARGET_FAMILIES: List[Dict[str, Any]] = [
     },
 ]
 
-CROSS_FAMILY_SWITCH_ORDER = ["stm32f1", "esp32", "ch32v003", "rp2040"]
+CROSS_FAMILY_SWITCH_ORDER = ["stm32f1", "stm32f4", "esp32", "ch32v003", "rp2040"]
 
 
 @dataclasses.dataclass

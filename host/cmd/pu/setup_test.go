@@ -235,6 +235,9 @@ func TestSetupInstallVerifyIdempotencyAndUninstall(t *testing.T) {
 	// and a third-party entry in debug_custom.json.
 	stmDir := filepath.Join(arduinoDir, "packages", "STMicroelectronics", "hardware", "stm32", "2.12.0")
 	thirdPartyProg := "# >>> PICO-UNIVERSAL-BEGIN-CUSTOM\ncustom_stlink.name=Custom STLink\n# <<< PICO-UNIVERSAL-END-CUSTOM"
+	if err := os.WriteFile(filepath.Join(stmDir, "programmers.txt"), []byte(thirdPartyProg), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(stmDir, "programmers.local.txt"), []byte(thirdPartyProg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +272,7 @@ func TestSetupInstallVerifyIdempotencyAndUninstall(t *testing.T) {
 	snapshotFirst := make(map[string]string)
 	for _, fam := range testCoreRelDirs {
 		coreDir := filepath.Join(arduinoDir, fam.relDir)
-		for _, fn := range []string{"programmers.local.txt", "platform.local.txt", "debug_custom.json"} {
+		for _, fn := range []string{"programmers.txt", "programmers.local.txt", "platform.local.txt", "debug_custom.json"} {
 			full := filepath.Join(coreDir, fn)
 			raw, err := os.ReadFile(full)
 			if err != nil {
@@ -334,10 +337,12 @@ func TestSetupInstallVerifyIdempotencyAndUninstall(t *testing.T) {
 		}
 	}
 
-	// Confirm third-party STM32 entries were preserved alongside Pico Universal!
-	stmProgAfter := snapshotFirst[filepath.Join(stmDir, "programmers.local.txt")]
-	if !strings.Contains(stmProgAfter, "custom_stlink.name=Custom STLink") || !strings.Contains(stmProgAfter, "# >>> PICO-UNIVERSAL-BEGIN-CUSTOM") {
-		t.Fatalf("STM32 third-party programmers.local.txt lost:\n%s", stmProgAfter)
+	// Confirm third-party STM32 entries were preserved alongside Pico Universal in both programmers.txt and programmers.local.txt!
+	for _, progFn := range []string{"programmers.txt", "programmers.local.txt"} {
+		stmProgAfter := snapshotFirst[filepath.Join(stmDir, progFn)]
+		if !strings.Contains(stmProgAfter, "custom_stlink.name=Custom STLink") || !strings.Contains(stmProgAfter, "# >>> PICO-UNIVERSAL-BEGIN-CUSTOM") {
+			t.Fatalf("STM32 third-party %s lost:\n%s", progFn, stmProgAfter)
+		}
 	}
 	if !strings.Contains(snapshotFirst[filepath.Join(stmDir, "debug_custom.json")], `"custom-jlink"`) {
 		t.Fatalf("STM32 third-party debug_custom.json entry lost:\n%s", snapshotFirst[filepath.Join(stmDir, "debug_custom.json")])
@@ -380,15 +385,17 @@ func TestSetupInstallVerifyIdempotencyAndUninstall(t *testing.T) {
 		t.Fatalf("pu setup --uninstall failed: %s", stderr)
 	}
 
-	stmProgFinal, err := os.ReadFile(filepath.Join(stmDir, "programmers.local.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(stmProgFinal), "pico_universal.name=") {
-		t.Fatalf("Pico Universal block remained after uninstall:\n%s", string(stmProgFinal))
-	}
-	if !strings.Contains(string(stmProgFinal), "custom_stlink.name=Custom STLink") || !strings.Contains(string(stmProgFinal), "# >>> PICO-UNIVERSAL-BEGIN-CUSTOM") {
-		t.Fatalf("third-party block damaged by uninstall:\n%s", string(stmProgFinal))
+	for _, progFn := range []string{"programmers.txt", "programmers.local.txt"} {
+		stmProgFinal, err := os.ReadFile(filepath.Join(stmDir, progFn))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(stmProgFinal), "pico_universal.name=") {
+			t.Fatalf("Pico Universal block remained in %s after uninstall:\n%s", progFn, string(stmProgFinal))
+		}
+		if !strings.Contains(string(stmProgFinal), "custom_stlink.name=Custom STLink") || !strings.Contains(string(stmProgFinal), "# >>> PICO-UNIVERSAL-BEGIN-CUSTOM") {
+			t.Fatalf("third-party block in %s damaged by uninstall:\n%s", progFn, string(stmProgFinal))
+		}
 	}
 
 	stmDbgFinal, err := os.ReadFile(filepath.Join(stmDir, "debug_custom.json"))

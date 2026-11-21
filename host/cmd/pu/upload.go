@@ -69,9 +69,9 @@ func resolveUploadFamily(familyFlag, coreFlag, fqbnFlag, boardFlag string) (stri
 		}
 		lowerFQBN := strings.ToLower(fqbn)
 		switch {
-		case strings.Contains(lowerFQBN, ":genf1:") || strings.Contains(lowerFQBN, "f103"):
+		case strings.Contains(lowerFQBN, ":genf1:") || strings.Contains(lowerFQBN, "f103") || (strings.Contains(lowerFQBN, "stm32") && strings.Contains(lowerFQBN, "f1")):
 			return "stm32f1", nil
-		case strings.Contains(lowerFQBN, ":genf4:") || strings.Contains(lowerFQBN, "f401") || strings.Contains(lowerFQBN, "f411") || strings.Contains(lowerFQBN, "f407") || strings.Contains(lowerFQBN, "f446"):
+		case strings.Contains(lowerFQBN, ":genf4:") || strings.Contains(lowerFQBN, "f401") || strings.Contains(lowerFQBN, "f411") || strings.Contains(lowerFQBN, "f407") || strings.Contains(lowerFQBN, "f446") || (strings.Contains(lowerFQBN, "stm32") && strings.Contains(lowerFQBN, "f4")):
 			return "stm32f4", nil
 		case strings.Contains(lowerFQBN, "rpipico2"):
 			return "rp2350", nil

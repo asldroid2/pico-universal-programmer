@@ -311,3 +311,33 @@ func TestValidateLockRejectsConflictingDigestsForSameFilename(t *testing.T) {
 		t.Fatalf("expected conflicting filename digest error, got %v", err)
 	}
 }
+
+func TestResolveHostToolDiscoversArduino15FamilyToolchains(t *testing.T) {
+	fakeArduino := t.TempDir()
+	t.Setenv("ARDUINO_DIRECTORIES_DATA", fakeArduino)
+	t.Setenv("PATH", t.TempDir()) // empty PATH so fallback must be exercised
+
+	sfx := exeSuffix()
+	stmOcd := filepath.Join(fakeArduino, "packages", "STMicroelectronics", "tools", "xpack-openocd", "0.12.0-6", "bin", "openocd"+sfx)
+	espOcd := filepath.Join(fakeArduino, "packages", "esp32", "tools", "openocd-esp32", "v0.12.0-esp32", "bin", "openocd"+sfx)
+	wchGdb := filepath.Join(fakeArduino, "packages", "WCH", "tools", "riscv-none-embed-gcc", "8.2.0", "bin", "riscv-none-embed-gdb"+sfx)
+
+	for _, p := range []string{stmOcd, espOcd, wchGdb} {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got, err := ResolveHostTool(OpenOCDLookupNameForFamily("stm32f4")); err != nil || got != stmOcd {
+		t.Fatalf("expected stm32f4 OpenOCD %q, got %q err=%v", stmOcd, got, err)
+	}
+	if got, err := ResolveHostTool(OpenOCDLookupNameForFamily("esp32")); err != nil || got != espOcd {
+		t.Fatalf("expected esp32 OpenOCD %q, got %q err=%v", espOcd, got, err)
+	}
+	if got, err := ResolveHostTool("riscv-none-elf-gdb"); err != nil || got != wchGdb {
+		t.Fatalf("expected ch32v003 WCH GDB %q, got %q err=%v", wchGdb, got, err)
+	}
+}

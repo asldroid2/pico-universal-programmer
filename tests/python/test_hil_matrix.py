@@ -60,6 +60,16 @@ class TestHILMatrixRunner(unittest.TestCase):
         self.assertTrue(by_fam["stm32f1"]["passed"])
         self.assertFalse(by_fam["ch32v003"]["passed"])
 
+    def test_single_stm32f4_family_selection_passes_switch_gate(self) -> None:
+        report = run_hil_matrix.run_qualification(
+            mode="dry-run",
+            pu_bin="pu",
+            families=["stm32f4"],
+            cycles=2,
+        )
+        self.assertTrue(report["cross_family_switch"]["passed"])
+        self.assertTrue(report["summary"]["overall_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

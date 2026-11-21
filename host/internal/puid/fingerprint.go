@@ -128,7 +128,7 @@ type CommandRunner interface {
 type OSCommandRunner struct{}
 
 func (OSCommandRunner) LookPath(file string) (string, error) {
-	return exec.LookPath(file)
+	return catalog.ResolveHostTool(file)
 }
 
 func (OSCommandRunner) Run(spec CommandSpec, stdout, stderr io.Writer) error {
@@ -397,6 +397,8 @@ func classifySTM32F4(rep CheckReport, obs TargetObservation) CheckReport {
 	switch devID {
 	case 0x413:
 		part = "STM32F405/F407"
+	case 0x419:
+		part = "STM32F42x/F43x"
 	case 0x423:
 		part = "STM32F401xB/C"
 	case 0x433:
@@ -405,6 +407,14 @@ func classifySTM32F4(rep CheckReport, obs TargetObservation) CheckReport {
 		part = "STM32F411xC/E"
 	case 0x421:
 		part = "STM32F446xx"
+	case 0x434:
+		part = "STM32F469/F479"
+	case 0x441:
+		part = "STM32F412"
+	case 0x458:
+		part = "STM32F410"
+	case 0x463:
+		part = "STM32F413/F423"
 	}
 	if part == "" {
 		rep.Verdict = "ERR_FAMILY_MISMATCH"
@@ -1030,9 +1040,12 @@ func CheckTargetWithOptions(probe usbprobe.ProbeDevice, family string, opts Chec
 		return rep, nil
 	}
 
-	ocdBin, err := runner.LookPath("openocd")
+	ocdBin, err := runner.LookPath(catalog.OpenOCDLookupNameForFamily(normFamily))
 	if err != nil {
-		return CheckReport{}, fmt.Errorf("puid: openocd not found in PATH: %w", err)
+		ocdBin, err = runner.LookPath("openocd")
+		if err != nil {
+			return CheckReport{}, fmt.Errorf("puid: openocd not found in PATH: %w", err)
+		}
 	}
 
 	var args []string
@@ -1086,7 +1099,7 @@ func CheckTargetWithOptions(probe usbprobe.ProbeDevice, family string, opts Chec
 			"-c", "transport select swd",
 			"-c", "set CPUTAPID 0",
 			"-f", "target/stm32f1x.cfg",
-			"-c", "adapter speed 100; init; mdw 0xE0042000 1; mdh 0x1FFFF7E0 1; mdw 0xE00FFFD0 8; exit",
+			"-c", "adapter speed 100; init; echo [mdw 0xE0042000 1]; echo [mdh 0x1FFFF7E0 1]; echo [mdw 0xE00FFFD0 8]; exit",
 		}
 
 	case "stm32f4":
@@ -1095,7 +1108,7 @@ func CheckTargetWithOptions(probe usbprobe.ProbeDevice, family string, opts Chec
 			"-c", "adapter serial " + probe.Serial,
 			"-c", "transport select swd",
 			"-f", "target/stm32f4x.cfg",
-			"-c", "adapter speed 100; init; mdw 0xE0042000 1; mdh 0x1FFF7A22 1; mdw 0xE00FFFD0 8; exit",
+			"-c", "adapter speed 100; init; echo [mdw 0xE0042000 1]; echo [mdh 0x1FFF7A22 1]; echo [mdw 0xE00FFFD0 8]; exit",
 		}
 	}
 

@@ -265,6 +265,12 @@ uint8_t detect_running_slot(void) {
 void confirm_trial_boot_if_needed(uint8_t running_slot) {
     pu_journal_state_t state{};
     if (!pu_journal_load(&state)) {
+        /* Seed initial baseline A/B journal record on first boot after factory UF2 flash. */
+        state.active_slot = running_slot;
+        state.pending_slot = PU_SLOT_NONE;
+        state.boot_attempts = 0u;
+        state.flags = 0u;
+        (void)pu_journal_commit(&state);
         return;
     }
     if ((state.flags & PU_JOURNAL_FLAG_TRIAL) != 0u && state.pending_slot == running_slot) {
@@ -352,6 +358,7 @@ void core1_protocol_worker(void) {
 void pump_usb_endpoints(void) {
     if (__atomic_exchange_n(&g_dap_resp_flush_pending, false, __ATOMIC_ACQ_REL)) {
         dap_q_drain_consumer(g_dap_resp_q);
+        tud_vendor_n_read_flush(PU_TUD_VENDOR_IDX_DAP);
     }
     if (__atomic_exchange_n(&g_swio_tx_flush_pending, false, __ATOMIC_ACQ_REL)) {
         byte_q_drain_consumer(g_swio_tx_q);

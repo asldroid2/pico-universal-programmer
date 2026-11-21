@@ -605,4 +605,32 @@ func TestCheckTargetIF5PreFlightDetectsBusyFaultAndPopulatesTelemetry(t *testing
 	if len(runner.ran) != 1 || !strings.Contains(strings.Join(runner.ran[0].Args, " | "), "adapter speed 5000") {
 		t.Fatalf("expected explicit 'adapter speed 5000' in esp32s3 OpenOCD check args: %+v", runner.ran)
 	}
+
+	// 4. STM32F4 OpenOCD 0.12+ check wraps mdw/mdh in JimTcl echo [...] so register dumps print cleanly!
+	runner.ran = nil
+	runner.onRun = func(spec CommandSpec, stdout, stderr io.Writer) error {
+		fmt.Fprintln(stderr, "Info : SWD DPIDR 0x2ba01477")
+		fmt.Fprintln(stdout, "0xe0042000: 101f6413 ")
+		fmt.Fprintln(stdout, "0x1fff7a22: 0200 ")
+		fmt.Fprintln(stdout, "0xe00fffd0: 00000000 00000000 00000000 00000000 00000011 00000004 0000000a 00000000 ")
+		return nil
+	}
+	f4Rep, err := CheckTargetWithOptions(probe, "stm32f4", CheckOptions{
+		Runner: runner,
+		CtrlTransceiver: func(_ usbprobe.ProbeDevice, req []byte) ([]byte, error) {
+			if req[0] == usbprobe.CtrlCmdGetInfo {
+				return []byte{0x01, 0x00, 1, 0, 0, 1, 0x07, usbprobe.EngineIdle, 0, 0, 0, 0, 0}, nil
+			}
+			return []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0}, nil
+		},
+	})
+	if err != nil || !f4Rep.Ready || f4Rep.Board != "STM32F405/F407" || f4Rep.FlashKB != 512 || f4Rep.ChipID != "0x2BA01477/0x413" {
+		t.Fatalf("expected genuine STM32F405/F407 512 KiB report, got rep=%+v err=%v", f4Rep, err)
+	}
+	f4Args := strings.Join(runner.ran[0].Args, " | ")
+	for _, want := range []string{"echo [mdw 0xE0042000 1]", "echo [mdh 0x1FFF7A22 1]", "echo [mdw 0xE00FFFD0 8]"} {
+		if !strings.Contains(f4Args, want) {
+			t.Fatalf("expected %q in stm32f4 OpenOCD check args: %s", want, f4Args)
+		}
+	}
 }

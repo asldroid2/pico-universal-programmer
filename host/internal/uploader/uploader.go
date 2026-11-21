@@ -75,7 +75,7 @@ type CommandRunner interface {
 type OSCommandRunner struct{}
 
 func (OSCommandRunner) LookPath(file string) (string, error) {
-	return exec.LookPath(file)
+	return catalog.ResolveHostTool(file)
 }
 
 func (OSCommandRunner) Run(spec CommandSpec, stdout, stderr io.Writer) error {
@@ -384,6 +384,9 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 		}
 		gdbBin, lookErr := runner.LookPath("riscv-none-elf-gdb")
 		if lookErr != nil {
+			gdbBin, lookErr = runner.LookPath("riscv-none-embed-gdb")
+		}
+		if lookErr != nil {
 			gdbBin, lookErr = runner.LookPath("gdb-multiarch")
 			if lookErr != nil {
 				return fmt.Errorf("uploader: riscv-none-elf-gdb not found in PATH: %w", lookErr)
@@ -441,9 +444,12 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 		return nil
 	}
 
-	ocdBin, err := runner.LookPath("openocd")
+	ocdBin, err := runner.LookPath(catalog.OpenOCDLookupNameForFamily(family))
 	if err != nil {
-		return fmt.Errorf("uploader: openocd not found in PATH: %w", err)
+		ocdBin, err = runner.LookPath("openocd")
+		if err != nil {
+			return fmt.Errorf("uploader: openocd not found in PATH: %w", err)
+		}
 	}
 
 	var args []string
@@ -480,8 +486,11 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			"-c", "transport select swd",
 			"-c", "adapter speed 4000",
 			"-f", targetCfg,
-			"-c", progCmd,
 		}
+		if family == "stm32f4" {
+			args = append(args, "-c", `stm32f4x.cpu configure -event reset-init "[stm32f4x.cpu cget -event reset-init]; adapter speed 4000"`)
+		}
+		args = append(args, "-c", progCmd)
 
 	case "esp32", "esp32s3":
 		if family == "esp32" {

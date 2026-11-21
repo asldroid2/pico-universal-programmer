@@ -328,17 +328,19 @@ func installSetup(ctx cliContext, tc *catalog.TargetsCatalog, lock *catalog.Depe
 			return err
 		}
 
-		progPath := filepath.Join(hwDir, "programmers.local.txt")
-		oldProg, err := readOptionalNonSymlink(progPath)
-		if err != nil {
-			return err
-		}
-		newProg, err := MergeManagedBlock(oldProg, renderProgrammersBody(family))
-		if err != nil {
-			return fmt.Errorf("%s: %w", progPath, err)
-		}
-		if err := atomicWriteFile(progPath, []byte(newProg), 0o644); err != nil {
-			return err
+		for _, progFn := range []string{"programmers.txt", "programmers.local.txt"} {
+			progPath := filepath.Join(hwDir, progFn)
+			oldProg, err := readOptionalNonSymlink(progPath)
+			if err != nil {
+				return err
+			}
+			newProg, err := MergeManagedBlock(oldProg, renderProgrammersBody(family))
+			if err != nil {
+				return fmt.Errorf("%s: %w", progPath, err)
+			}
+			if err := atomicWriteFile(progPath, []byte(newProg), 0o644); err != nil {
+				return err
+			}
 		}
 
 		platPath := filepath.Join(hwDir, "platform.local.txt")
@@ -394,7 +396,7 @@ func uninstallSetup(ctx cliContext, tc *catalog.TargetsCatalog, opts setupOption
 			return err
 		}
 
-		for _, fn := range []string{"programmers.local.txt", "platform.local.txt"} {
+		for _, fn := range []string{"programmers.txt", "programmers.local.txt", "platform.local.txt"} {
 			p := filepath.Join(hwDir, fn)
 			if _, statErr := os.Lstat(p); errors.Is(statErr, os.ErrNotExist) {
 				continue
@@ -486,13 +488,15 @@ func verifySetup(ctx cliContext, tc *catalog.TargetsCatalog, lock *catalog.Depen
 			return fmt.Errorf("core %s not properly installed: %w", family, err)
 		}
 
-		progPath := filepath.Join(hwDir, "programmers.local.txt")
-		progBody, ok, err := ExtractManagedBlock(progPath)
-		if err != nil {
-			return err
-		}
-		if !ok || !strings.Contains(progBody, "pico_universal.name=") {
-			return fmt.Errorf("missing Pico Universal managed block in %s", progPath)
+		for _, progFn := range []string{"programmers.txt", "programmers.local.txt"} {
+			progPath := filepath.Join(hwDir, progFn)
+			progBody, ok, err := ExtractManagedBlock(progPath)
+			if err != nil {
+				return err
+			}
+			if !ok || !strings.Contains(progBody, "pico_universal.name=") {
+				return fmt.Errorf("missing Pico Universal managed block in %s", progPath)
+			}
 		}
 
 		platPath := filepath.Join(hwDir, "platform.local.txt")

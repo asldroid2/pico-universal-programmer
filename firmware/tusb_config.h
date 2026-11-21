@@ -61,9 +61,14 @@ extern "C" {
 #define CFG_TUD_HID               0
 #define CFG_TUD_MIDI              0
 
+/* Preserve discrete 64-byte CMSIS-DAPv2 & IF 5 Bulk packet boundaries:
+ *   - RX_BUFSIZE = 64 holds EP OUT in USB NAK until the prior packet is drained,
+ *     preventing byte-stream merging across pipelined Bulk OUT packets.
+ *   - TX_BUFSIZE = 0 writes directly to EP IN buffer (1 packet per transfer),
+ *     preventing response coalescing and spurious 64-byte ZLP injection. */
 #define CFG_TUD_VENDOR_EPSIZE     64
-#define CFG_TUD_VENDOR_RX_BUFSIZE 512
-#define CFG_TUD_VENDOR_TX_BUFSIZE 512
+#define CFG_TUD_VENDOR_RX_BUFSIZE 64
+#define CFG_TUD_VENDOR_TX_BUFSIZE 0
 
 #define CFG_TUD_CDC_EP_BUFSIZE    64
 #define CFG_TUD_CDC_RX_BUFSIZE    512

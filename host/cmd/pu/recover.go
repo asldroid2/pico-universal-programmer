@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/catalog"
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/usbprobe"
 )
 
@@ -95,41 +96,29 @@ func recoverCH32V003(ctx cliContext, probe usbprobe.ProbeDevice) int {
 	return 0
 }
 
-func recoverSTM32(ctx cliContext, probe usbprobe.ProbeDevice, family string) int {
-	ocdBin, err := ctx.cmdRunner.LookPath("openocd")
-	if err != nil {
-		fmt.Fprintf(ctx.stderr, "pu recover: openocd not found in PATH: %v\n", err)
-		return 1
-	}
-
-	var args []string
+func buildSTM32RecoverArgs(serial, family, resetCfg string) []string {
 	switch family {
 	case "stm32f1":
-		args = []string{
+		return []string{
 			"-f", "interface/cmsis-dap.cfg",
-			"-c", "adapter serial " + probe.Serial,
+			"-c", "adapter serial " + serial,
 			"-c", "transport select swd",
 			"-c", "set CPUTAPID 0",
 			"-f", "target/stm32f1x.cfg",
-			"-c", "adapter speed 100; reset_config srst_only srst_nogate connect_assert_srst; init; reset halt; stm32f1x unlock 0; reset halt; stm32f1x mass_erase 0; reset halt; exit",
+			"-c", "adapter speed 100; " + resetCfg + "; init; reset halt; stm32f1x unlock 0; reset halt; stm32f1x mass_erase 0; reset halt; exit",
 		}
-	case "stm32f4":
-		args = []string{
+	default:
+		return []string{
 			"-f", "interface/cmsis-dap.cfg",
-			"-c", "adapter serial " + probe.Serial,
+			"-c", "adapter serial " + serial,
 			"-c", "transport select swd",
 			"-f", "target/stm32f4x.cfg",
-			"-c", "adapter speed 100; reset_config srst_only srst_nogate connect_assert_srst; init; reset halt; stm32f2x unlock 0; reset halt; stm32f2x mass_erase 0; reset halt; exit",
+			"-c", "adapter speed 100; " + resetCfg + "; init; reset halt; stm32f2x unlock 0; reset halt; stm32f2x mass_erase 0; reset halt; exit",
 		}
 	}
+}
 
-	var outBuf, errBuf bytes.Buffer
-	runErr := ctx.cmdRunner.Run(commandSpec{Name: ocdBin, Args: args}, &outBuf, &errBuf)
-	combined := strings.TrimSpace(outBuf.String() + "\n" + errBuf.String())
-	if runErr != nil {
-		fmt.Fprintf(ctx.stderr, "pu recover: %s mass erase failed: %v (%s)\n", family, runErr, combined)
-		return 1
-	}
+func checkOpenOCDRecoverFailure(combined string) string {
 	lower := strings.ToLower(combined)
 	for _, bad := range []string{
 		"error:",
@@ -142,12 +131,62 @@ func recoverSTM32(ctx cliContext, probe usbprobe.ProbeDevice, family string) int
 		"swd dp initialization failed",
 	} {
 		if strings.Contains(lower, bad) {
-			fmt.Fprintf(ctx.stderr, "pu recover: %s recovery reported OpenOCD error (%q): %s\n", family, bad, combined)
+			return bad
+		}
+	}
+	return ""
+}
+
+func recoverSTM32(ctx cliContext, probe usbprobe.ProbeDevice, family string) int {
+	ocdBin, err := ctx.cmdRunner.LookPath(catalog.OpenOCDLookupNameForFamily(family))
+	if err != nil {
+		ocdBin, err = ctx.cmdRunner.LookPath("openocd")
+		if err != nil {
+			fmt.Fprintf(ctx.stderr, "pu recover: openocd not found in PATH: %v\n", err)
 			return 1
 		}
 	}
 
-	fmt.Fprintf(ctx.stdout, "Recovered %s target via connect_assert_srst unlock + mass_erase on probe %s.\n", family, probe.Serial)
+	runAttempt := func(resetCfg string) (string, error) {
+		var outBuf, errBuf bytes.Buffer
+		args := buildSTM32RecoverArgs(probe.Serial, family, resetCfg)
+		runErr := ctx.cmdRunner.Run(commandSpec{Name: ocdBin, Args: args}, &outBuf, &errBuf)
+		return strings.TrimSpace(outBuf.String() + "\n" + errBuf.String()), runErr
+	}
+
+	combined, runErr := runAttempt("reset_config srst_only srst_nogate connect_assert_srst")
+	lower := strings.ToLower(combined)
+	srstDisconnectedFallback := strings.Contains(lower, "examination succeed") &&
+		strings.Contains(lower, "timed out while waiting for target halted") &&
+		!strings.Contains(lower, "unlock failed") &&
+		!strings.Contains(lower, "mass erase failed")
+
+	usedSysReset := false
+	if srstDisconnectedFallback {
+		combined, runErr = runAttempt("reset_config none")
+		usedSysReset = true
+	}
+
+	if runErr != nil {
+		fmt.Fprintf(ctx.stderr, "pu recover: %s mass erase failed: %v (%s)\n", family, runErr, combined)
+		if strings.Contains(strings.ToLower(combined), "swd dp initialization failed") || strings.Contains(strings.ToLower(combined), "error connecting dp") {
+			fmt.Fprintln(ctx.stderr, "Hint: connect Pico GP6 (Pin 9) to STM32 NRST (or hold physical RESET while running 'pu recover') if firmware disabled SWD pins.")
+		}
+		return 1
+	}
+	if bad := checkOpenOCDRecoverFailure(combined); bad != "" {
+		fmt.Fprintf(ctx.stderr, "pu recover: %s recovery reported OpenOCD error (%q): %s\n", family, bad, combined)
+		if strings.Contains(strings.ToLower(combined), "swd dp initialization failed") || strings.Contains(strings.ToLower(combined), "error connecting dp") {
+			fmt.Fprintln(ctx.stderr, "Hint: connect Pico GP6 (Pin 9) to STM32 NRST (or hold physical RESET while running 'pu recover') if firmware disabled SWD pins.")
+		}
+		return 1
+	}
+
+	if usedSysReset {
+		fmt.Fprintf(ctx.stdout, "Recovered %s target via software SYSRESETREQ unlock + mass_erase on probe %s (NRST not connected).\n", family, probe.Serial)
+	} else {
+		fmt.Fprintf(ctx.stdout, "Recovered %s target via connect_assert_srst unlock + mass_erase on probe %s.\n", family, probe.Serial)
+	}
 	fmt.Fprintln(ctx.stdout, "Note: power-cycle target VDD if flash Option Bytes (RDP) were previously locked.")
 	return 0
 }

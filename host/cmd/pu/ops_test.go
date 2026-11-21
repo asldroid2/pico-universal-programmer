@@ -384,6 +384,35 @@ func TestPURecoverCH32AndSTM32MassErase(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("expected STM32 recover to fail on OpenOCD unlock error even with exit 0")
 	}
+
+	// 5. 4-pin SWD header without NRST wired: srst_only examines CPU then times out waiting for SRST halt -> automatically falls back to reset_config none (SYSRESETREQ)!
+	runner.ran = nil
+	attempt := 0
+	runner.onRun = func(cmd commandSpec, stdout, stderr io.Writer) error {
+		attempt++
+		if attempt == 1 {
+			fmt.Fprintln(stderr, "Info : [stm32f4x.cpu] Examination succeed")
+			fmt.Fprintln(stderr, "Error: timed out while waiting for target halted")
+			return errors.New("exit status 1")
+		}
+		fmt.Fprintln(stderr, "Info : [stm32f4x.cpu] Examination succeed")
+		fmt.Fprintln(stdout, "stm32f2x unlocked.\nstm32x mass erase complete")
+		return nil
+	}
+	out.Reset()
+	errBuf.Reset()
+	code = runWithEnv([]string{"recover", "--family", "stm32f4"}, cliEnv{
+		stdout:         &out,
+		stderr:         &errBuf,
+		cmdRunner:      runner,
+		discoverProbes: singleFakeProbe(),
+	})
+	if code != 0 || len(runner.ran) != 2 {
+		t.Fatalf("expected 2-step SYSRESETREQ fallback on unconnected NRST, got code=%d runs=%d stderr=%s", code, len(runner.ran), errBuf.String())
+	}
+	if !strings.Contains(strings.Join(runner.ran[1].args, " "), "reset_config none") || !strings.Contains(out.String(), "SYSRESETREQ") {
+		t.Fatalf("expected reset_config none fallback and SYSRESETREQ message, got args=%v out=%s", runner.ran[1].args, out.String())
+	}
 }
 
 func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {

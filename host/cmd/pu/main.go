@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/catalog"
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/gdbpipe"
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/usbprobe"
 )
@@ -35,7 +36,7 @@ type commandRunner interface {
 type osCommandRunner struct{}
 
 func (osCommandRunner) LookPath(file string) (string, error) {
-	return exec.LookPath(file)
+	return catalog.ResolveHostTool(file)
 }
 
 func (osCommandRunner) Run(spec commandSpec, stdout, stderr io.Writer) error {
