@@ -387,7 +387,7 @@ func TestPURecoverCH32AndSTM32MassErase(t *testing.T) {
 }
 
 func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
-	for _, family := range []string{"stm32f1", "rp2040", "esp32", "ch32v003"} {
+	for _, family := range []string{"stm32f1", "rp2040", "esp32", "esp32s3", "ch32v003"} {
 		t.Run(family, func(t *testing.T) {
 			projDir := t.TempDir()
 			vscodeDir := filepath.Join(projDir, ".vscode")
@@ -460,6 +460,12 @@ func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
 			if family == "esp32" {
 				if !strings.Contains(string(ocdRaw), "ESP32_FLASH_VOLTAGE 3.3") || !strings.Contains(string(ocdRaw), "cmsis_dap_vid_pid 0x2e8a 0x1050") {
 					t.Fatalf("expected embedded Zbit/ESP32 OpenOCD config and PID in %s:\n%s", ocdPath, string(ocdRaw))
+				}
+			}
+			if family == "esp32" || family == "esp32s3" {
+				preLaunch, ok := puCfg["preLaunchCommands"].([]any)
+				if !ok || len(preLaunch) == 0 || preLaunch[0] != "set remotetimeout 20" {
+					t.Fatalf("expected preLaunchCommands ['set remotetimeout 20'] for %s in launch.json, got %#v", family, puCfg["preLaunchCommands"])
 				}
 			}
 			if family == "ch32v003" {

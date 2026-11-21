@@ -755,6 +755,9 @@ func buildDebugCustomEntries(tc *catalog.TargetsCatalog, family string, profileN
 			} else {
 				entry["configFiles"] = []string{"interface/cmsis-dap.cfg", prof.Target}
 			}
+			if profName == "esp32" || profName == "esp32s3" {
+				entry["preLaunchCommands"] = []string{"set remotetimeout 20"}
+			}
 		}
 		entries = append(entries, entry)
 	}

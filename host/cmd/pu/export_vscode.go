@@ -226,7 +226,7 @@ func buildVSCodeLaunchConfig(family, serial, pidHex, elfPath string) map[string]
 			gdbBin = "xtensa-esp32s3-elf-gdb"
 		}
 	}
-	return map[string]any{
+	cfg := map[string]any{
 		"name":            "Pico Universal Debug (" + family + ")",
 		"type":            "cortex-debug",
 		"request":         "launch",
@@ -240,6 +240,10 @@ func buildVSCodeLaunchConfig(family, serial, pidHex, elfPath string) map[string]
 			"${workspaceFolder}/.vscode/pico-universal-openocd.cfg",
 		},
 	}
+	if family == "esp32" || family == "esp32s3" {
+		cfg["preLaunchCommands"] = []string{"set remotetimeout 20"}
+	}
+	return cfg
 }
 
 func mergeVSCodeLaunchJSON(launchPath string, newCfg map[string]any) ([]byte, error) {

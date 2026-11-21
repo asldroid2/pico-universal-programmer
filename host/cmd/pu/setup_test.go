@@ -316,9 +316,15 @@ func TestSetupInstallVerifyIdempotencyAndUninstall(t *testing.T) {
 				if !strings.Contains(fmt.Sprint(entry["configFiles"]), stagedESP32Slash) {
 					t.Fatalf("esp32 debug config does not reference staged %s: %+v", stagedESP32Slash, entry)
 				}
+				if !strings.Contains(fmt.Sprint(entry["preLaunchCommands"]), "set remotetimeout 20") {
+					t.Fatalf("esp32 debug config missing preLaunchCommands set remotetimeout 20: %+v", entry)
+				}
 			case "esp32s3":
 				if !strings.Contains(fmt.Sprint(entry["configFiles"]), "target/esp32s3.cfg") {
 					t.Fatalf("esp32s3 missing target/esp32s3.cfg: %+v", entry)
+				}
+				if !strings.Contains(fmt.Sprint(entry["preLaunchCommands"]), "set remotetimeout 20") {
+					t.Fatalf("esp32s3 debug config missing preLaunchCommands set remotetimeout 20: %+v", entry)
 				}
 			case "ch32v003":
 				if !strings.Contains(fmt.Sprint(entry["gdbTarget"]), "gdb-pipe") {

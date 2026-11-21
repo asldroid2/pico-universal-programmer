@@ -224,10 +224,25 @@ func ClassifyTarget(obs TargetObservation) (CheckReport, error) {
 	if obs.DPIDCode == 0 || obs.DPIDCode == 0xFFFFFFFF {
 		rep.Verdict = "ERR_NO_TARGET"
 		rep.Diagnosis = "No valid SWD/JTAG IDCODE reply from target MCU"
-		rep.Remediation = []string{
-			"Check target board power (3.3 V / VTREF) and shared GND connection.",
-			"Verify SWCLK/SWDIO (or JTAG TCK/TMS/TDI/TDO) ribbon wiring.",
-			"If user firmware disabled debug pins or entered deep sleep, run 'pu recover --family " + family + "' or hold NRST.",
+		switch family {
+		case "stm32f1", "stm32f4", "ch32v003":
+			rep.Remediation = []string{
+				"Check target board power (3.3 V / VTREF) and shared GND connection.",
+				"Verify SWCLK/SWDIO (or SWIO) ribbon wiring.",
+				"If user firmware disabled debug pins or entered deep sleep, run 'pu recover --family " + family + "' or hold NRST.",
+			}
+		case "esp32", "esp32s3":
+			rep.Remediation = []string{
+				"Check target board power (3.3 V / VTREF) and shared GND connection.",
+				"Verify 4-wire JTAG wiring (GPIO13=TCK, GPIO14=TMS, GPIO12=TDI, GPIO15=TDO).",
+				"Check EN/BOOT state (ROM download mode muxes GPIO12..15 to SDIO, disabling JTAG) or flash a JTAG-safe image if user firmware reconfigured GPIO12..15 or entered deep sleep.",
+			}
+		default:
+			rep.Remediation = []string{
+				"Check target board power (3.3 V / VTREF) and shared GND connection.",
+				"Verify SWCLK/SWDIO ribbon wiring.",
+				"Power-cycle or hold RUN/BOOTSEL if user firmware disabled SWD pins or entered deep sleep.",
+			}
 		}
 		return rep, nil
 	}
@@ -1037,7 +1052,7 @@ func CheckTargetWithOptions(probe usbprobe.ProbeDevice, family string, opts Chec
 		args = []string{
 			"-c", "adapter serial " + probe.Serial,
 			"-f", filepath.ToSlash(cfgPath),
-			"-c", "init; exit",
+			"-c", "init; resume; exit",
 		}
 
 	case "esp32s3":

@@ -386,8 +386,48 @@ func TestCheckTargetAcquiresLockAndInvokesTransportsOffline(t *testing.T) {
 	if stagedCfgSeen == "" {
 		t.Fatal("expected staged pu-esp32.cfg to be passed to OpenOCD")
 	}
+	if !strings.Contains(strings.Join(runner.ran[0].Args, " | "), "init; resume; exit") {
+		t.Fatalf("expected non-destructive 'init; resume; exit' for esp32 check, got args: %v", runner.ran[0].Args)
+	}
 	if _, statErr := os.Stat(stagedCfgSeen); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("expected staged pu-esp32.cfg temp dir to be cleaned up, statErr=%v", statErr)
+	}
+
+	// Verify ERR_NO_TARGET remediation only suggests `pu recover` for supported families (stm32f1/stm32f4/ch32v003)
+	// and provides EN/BOOT + SDIO/GPIO12..15 guidance for esp32/esp32s3.
+	for _, fam := range []string{"stm32f1", "stm32f4"} {
+		noTgt, err := ClassifyTarget(TargetObservation{Family: fam, DPIDCode: 0})
+		if err != nil || noTgt.Verdict != "ERR_NO_TARGET" {
+			t.Fatalf("expected ERR_NO_TARGET for %s, got %+v err=%v", fam, noTgt, err)
+		}
+		joined := strings.Join(noTgt.Remediation, " ")
+		if !strings.Contains(joined, "pu recover --family "+fam) {
+			t.Fatalf("expected pu recover guidance for %s, got %v", fam, noTgt.Remediation)
+		}
+	}
+	for _, fam := range []string{"esp32", "esp32s3"} {
+		noTgt, err := ClassifyTarget(TargetObservation{Family: fam, DPIDCode: 0})
+		if err != nil || noTgt.Verdict != "ERR_NO_TARGET" {
+			t.Fatalf("expected ERR_NO_TARGET for %s, got %+v err=%v", fam, noTgt, err)
+		}
+		joined := strings.Join(noTgt.Remediation, " ")
+		if strings.Contains(joined, "pu recover") {
+			t.Fatalf("must not suggest unsupported 'pu recover' for %s: %v", fam, noTgt.Remediation)
+		}
+		for _, want := range []string{"EN/BOOT", "SDIO", "GPIO12..15", "deep sleep"} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("expected %q in %s ERR_NO_TARGET remediation, got %v", want, fam, noTgt.Remediation)
+			}
+		}
+	}
+	for _, fam := range []string{"rp2040", "rp2350"} {
+		noTgt, err := ClassifyTarget(TargetObservation{Family: fam, DPIDCode: 0})
+		if err != nil || noTgt.Verdict != "ERR_NO_TARGET" {
+			t.Fatalf("expected ERR_NO_TARGET for %s, got %+v err=%v", fam, noTgt, err)
+		}
+		if strings.Contains(strings.Join(noTgt.Remediation, " "), "pu recover") {
+			t.Fatalf("must not suggest unsupported 'pu recover' for %s: %v", fam, noTgt.Remediation)
+		}
 	}
 
 	// Check CH32V003 via raw CDC PortOpener (MUST NOT spawn riscv-none-elf-gdb!)
