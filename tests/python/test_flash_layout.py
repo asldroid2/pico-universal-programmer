@@ -676,10 +676,15 @@ class FoundationBaselineTests(unittest.TestCase):
             )
             self.assertEqual(res.returncode, 0, f"udevadm verify failed:\n{res.stderr}\n{res.stdout}")
 
-    def test_ci_workflow_pins_actions_and_checks_mixed_c_cxx_and_windows(self) -> None:
+    def test_ci_workflow_pins_actions_and_checks_linux_only(self) -> None:
         ci_path = ROOT / ".github" / "workflows" / "ci.yml"
         self.assertTrue(ci_path.is_file(), ".github/workflows/ci.yml must exist")
         ci_text = ci_path.read_text(encoding="utf-8")
+
+        # CI must target Linux only (no Windows CI job while focusing on Linux qualification)
+        self.assertIn("verify-linux:", ci_text)
+        self.assertNotIn("verify-windows:", ci_text)
+        self.assertNotIn("windows-latest", ci_text)
 
         # Every `uses:` action must be pinned to a full 40-char commit SHA
         uses_refs = [
@@ -687,7 +692,7 @@ class FoundationBaselineTests(unittest.TestCase):
             for line in ci_text.splitlines()
             if (m := re.match(r"^\s*-?\s*uses:\s*([^\s#]+)", line))
         ]
-        self.assertGreaterEqual(len(uses_refs), 6)
+        self.assertGreaterEqual(len(uses_refs), 3)
         for ref in uses_refs:
             self.assertRegex(
                 ref,
@@ -695,7 +700,7 @@ class FoundationBaselineTests(unittest.TestCase):
                 f"GitHub Action must be pinned to a 40-char commit SHA: {ref!r}",
             )
 
-        linux_part, windows_part = ci_text.split("verify-windows:", 1)
+        linux_part = ci_text.split("verify-linux:", 1)[1]
 
         # Linux job must enforce -Wundef, check default C++17 board_pinout.h, and compile C tests to .o then link with c++
         self.assertIn("-Wundef", linux_part)
@@ -711,30 +716,24 @@ class FoundationBaselineTests(unittest.TestCase):
             ),
         )
 
-        # Windows job must also check C/C++ headers with -Wundef and compile/run tests/host_c when present
-        self.assertIn("-Wundef", windows_part)
-        self.assertIn("config/board_pinout.h", windows_part)
-        self.assertIn("tests/host_c", windows_part)
-
         # Every host C/C++ compilation command (CMake C/CXX flags + 4 fallback compile commands)
-        # in both verify-linux and verify-windows must pass -DPU_HOST_TEST=1.
-        for job_name, job_part in (("verify-linux", linux_part), ("verify-windows", windows_part)):
-            host_step = job_part.split("tests/host_c/run_tests.sh", 1)[1]
-            self.assertGreaterEqual(
-                host_step.count("-DPU_HOST_TEST=1"),
-                6,
-                f"{job_name} host C/C++ step must pass -DPU_HOST_TEST=1 in CMake and all fallback compile commands",
-            )
-            for line in host_step.splitlines():
-                stripped = line.strip()
-                if stripped.startswith(("-DCMAKE_C_FLAGS=", "-DCMAKE_CXX_FLAGS=")) or (
-                    " -c " in stripped and ("$src" in stripped or "$tsrc" in stripped)
-                ):
-                    self.assertIn(
-                        "-DPU_HOST_TEST=1",
-                        stripped,
-                        f"{job_name} compile line missing -DPU_HOST_TEST=1: {stripped!r}",
-                    )
+        # in verify-linux must pass -DPU_HOST_TEST=1.
+        host_step = linux_part.split("tests/host_c/run_tests.sh", 1)[1]
+        self.assertGreaterEqual(
+            host_step.count("-DPU_HOST_TEST=1"),
+            6,
+            "verify-linux host C/C++ step must pass -DPU_HOST_TEST=1 in CMake and all fallback compile commands",
+        )
+        for line in host_step.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("-DCMAKE_C_FLAGS=", "-DCMAKE_CXX_FLAGS=")) or (
+                " -c " in stripped and ("$src" in stripped or "$tsrc" in stripped)
+            ):
+                self.assertIn(
+                    "-DPU_HOST_TEST=1",
+                    stripped,
+                    f"verify-linux compile line missing -DPU_HOST_TEST=1: {stripped!r}",
+                )
 
 
 if __name__ == "__main__":
