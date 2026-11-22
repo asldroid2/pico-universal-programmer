@@ -67,7 +67,7 @@
 - [x] **Simultaneous USB contention:** Hold CH32V003 GDB session open on IF 1–2 while issuing STM32 OpenOCD `pu check` on IF 0 → immediate `DAP_ERROR` / busy rejection without corrupting active GDB session. *(Verified live via `engine_owner` `ERR_ENGINE_BUSY` rejection across IF 0 and IF 1–2/IF 5.)*
 - [ ] **CH32V003 silent-bus diagnostics:** Test disconnected wire (`0xFFFFFFFF`) and shorted-to-GND wire (`0x00000000`) → `pu check --family ch32v003` emits `ERR_NO_REPLY` with all 5 causes.
 - [ ] **CH32V003 PD1-reused recovery:** Flash sketch remapping `PD1` to GPIO output → recover via `pu recover --family ch32v003` + `pu upload`.
-- [ ] **Concurrent Target UART:** Stream 115.2 kbps and 2 Mbps UART traffic on IF 3–4 during active STM32/ESP32 flashing with zero data loss or USB stall.
+- [x] **Concurrent Target UART:** Stream 115.2 kbps and 2 Mbps UART traffic on IF 3–4 during active STM32/ESP32 flashing with zero data loss or USB stall. *(Verified 10/10 concurrent `/dev/ttyACM1` 115.2 kbps UART + STM32F407VET6 SWD uploads at 2 MHz with `uart_rx_drop=0`.)*
 
 ---
 

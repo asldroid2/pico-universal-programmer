@@ -270,10 +270,14 @@ func TestUploadAtomicARMAndESP32OpenOCDCommands(t *testing.T) {
 		}, runner); err != nil {
 			t.Fatalf("UploadAtomic %s failed: %v", swdFam, err)
 		}
+		wantSpeed := "adapter speed 4000"
+		if swdFam == "stm32f1" || swdFam == "stm32f4" {
+			wantSpeed = "adapter speed 2000"
+		}
 		joinedArgs := strings.Join(runner.ran[0].Args, " | ")
 		for _, want := range []string{
 			"adapter serial " + probe.Serial,
-			"adapter speed 4000",
+			wantSpeed,
 			"program {",
 			"} verify reset exit",
 		} {

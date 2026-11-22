@@ -480,15 +480,19 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 			progCmd = fmt.Sprintf(`program %s 0x%08x verify reset exit`, bracedSnap, baseAddr)
 		}
 
+		swdSpeed := "4000"
+		if family == "stm32f1" || family == "stm32f4" {
+			swdSpeed = "2000"
+		}
 		args = []string{
 			"-f", "interface/cmsis-dap.cfg",
 			"-c", "adapter serial " + probe.Serial,
 			"-c", "transport select swd",
-			"-c", "adapter speed 4000",
+			"-c", "adapter speed " + swdSpeed,
 			"-f", targetCfg,
 		}
 		if family == "stm32f4" {
-			args = append(args, "-c", `stm32f4x.cpu configure -event reset-init "[stm32f4x.cpu cget -event reset-init]; adapter speed 4000"`)
+			args = append(args, "-c", `stm32f4x.cpu configure -event reset-init "[stm32f4x.cpu cget -event reset-init]; adapter speed 2000"`)
 		}
 		args = append(args, "-c", progCmd)
 

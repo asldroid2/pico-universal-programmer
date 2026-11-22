@@ -186,7 +186,7 @@ func renderVSCodeOpenOCDConfig(family, serial, pidHex string) string {
 			"source [find "+targetCfg+"]",
 		)
 		if family == "stm32f4" {
-			lines = append(lines, `stm32f4x.cpu configure -event reset-init "[stm32f4x.cpu cget -event reset-init]; adapter speed 4000"`)
+			lines = append(lines, `stm32f4x.cpu configure -event reset-init "[stm32f4x.cpu cget -event reset-init]; adapter speed 2000"`)
 		}
 		lines = append(lines, "")
 		return strings.Join(lines, "\n")
