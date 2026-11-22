@@ -404,14 +404,15 @@ func UploadAtomic(probe usbprobe.ProbeDevice, req UploadRequest, runner CommandR
 				"-nx",
 				"-ex", "set pagination off",
 				"-ex", "set confirm off",
-				"-ex", "set breakpoint auto-hw off",
+				"-ex", "set remotetimeout 20",
 				"-ex", "file " + quotedSnap,
-				"-ex", "target extended-remote " + formatGDBSerialTarget(probe.GDBPort),
+				"-ex", "target remote " + formatGDBSerialTarget(probe.GDBPort),
 				"-ex", "monitor reset halt",
 				"-ex", "load",
 				"-ex", "compare-sections",
 				"-ex", "monitor reset",
 				"-ex", "detach",
+				"-ex", "quit",
 			},
 		}
 		runErr := runner.Run(spec, outWriter, errWriter)

@@ -6,8 +6,11 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/catalog"
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/gdbpipe"
+	"github.com/nfsahsn/pico-universal-programmer/host/internal/puid"
 	"github.com/nfsahsn/pico-universal-programmer/host/internal/usbprobe"
 )
 
@@ -18,6 +21,7 @@ func runRecover(ctx cliContext, args []string) int {
 	familyFlag := fs.String("family", "", "Target MCU family to recover (ch32v003|stm32f1|stm32f4)")
 	serialFlag := fs.String("serial", "", "Select specific Pico Universal probe hardware serial number")
 	pidFlag := fs.String("pid", "", "Approved USB PID in hex (overrides PU_USB_PID)")
+	waitFlag := fs.Duration("wait", 0, "Optional POR catch window (e.g. 8s) while manually power-cycling CH32V003 VDD")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -54,12 +58,12 @@ func runRecover(ctx cliContext, args []string) int {
 	defer lk.Close()
 
 	if family == "ch32v003" {
-		return recoverCH32V003(ctx, probe)
+		return recoverCH32V003(ctx, probe, *waitFlag)
 	}
 	return recoverSTM32(ctx, probe, family)
 }
 
-func recoverCH32V003(ctx cliContext, probe usbprobe.ProbeDevice) int {
+func recoverCH32V003(ctx cliContext, probe usbprobe.ProbeDevice, waitWindow time.Duration) int {
 	if ctx.ctrlTransceiver != nil || strings.TrimSpace(probe.CtrlPath) != "" {
 		status, err := usbprobe.RequestCH32Unbrick(probe, ctx.ctrlTransceiver)
 		if err != nil {
@@ -80,7 +84,7 @@ func recoverCH32V003(ctx cliContext, probe usbprobe.ProbeDevice) int {
 				fmt.Fprintln(ctx.stderr, "pu recover: probe VTARG overcurrent fault is latched; inspect target wiring for shorts")
 				return 1
 			case usbprobe.CtrlStatusUnsupported:
-				// Fall through to guided manual power-cycle procedure for PU_BOARD_PICO dev hardware.
+				// Fall through to Track A (PU_BOARD_PICO) NRST + POR SWIO catch / guided power-cycle path.
 			default:
 				fmt.Fprintf(ctx.stderr, "pu recover: probe reported CH32 unbrick error status 0x%02x\n", status)
 				return 1
@@ -88,10 +92,51 @@ func recoverCH32V003(ctx cliContext, probe usbprobe.ProbeDevice) int {
 		}
 	}
 
+	if strings.TrimSpace(probe.GDBPort) != "" && (ctx.portOpener != nil || !ctx.hasFakeDiscover) {
+		opener := ctx.portOpener
+		if opener == nil {
+			opener = gdbpipe.OpenSerialPort
+		}
+		if waitWindow > 0 {
+			fmt.Fprintf(ctx.stdout, "Waiting up to %s for CH32V003 reset or VDD power-cycle to catch SWIO in POR window...\n", waitWindow)
+		}
+		if port, openErr := opener(probe.GDBPort); openErr == nil {
+			deadline := time.Now().Add(waitWindow)
+			for {
+				reply, exErr := puid.ExchangeCH32MonitorCmd(port, "unbrick", 2500*time.Millisecond)
+				trimmed := strings.TrimSpace(reply)
+				if exErr == nil && strings.Contains(trimmed, "UNBRICK:OK") {
+					_ = port.Close()
+					fmt.Fprintf(ctx.stdout, "CH32V003 NRST/POR catch-halt unbrick succeeded on probe %s.\n", probe.Serial)
+					fmt.Fprintln(ctx.stdout, "Next step: run 'pu upload --family ch32v003 --file <clean.elf>' FIRST to replace any PD1-remapping firmware, then verify with 'pu check --family ch32v003'.")
+					return 0
+				}
+				if exErr == nil && strings.Contains(trimmed, "UNBRICK:ERR_ENGINE_BUSY") {
+					_ = port.Close()
+					fmt.Fprintln(ctx.stderr, "pu recover: probe debug engine is busy; close active GDB/OpenOCD sessions and retry")
+					return 1
+				}
+				if exErr == nil && strings.Contains(trimmed, "UNBRICK:ERR_FAULT_LATCHED") {
+					_ = port.Close()
+					fmt.Fprintln(ctx.stderr, "pu recover: probe VTARG overcurrent fault is latched; inspect target wiring for shorts")
+					return 1
+				}
+				if waitWindow <= 0 || time.Now().After(deadline) {
+					break
+				}
+			}
+			_ = port.Close()
+			if waitWindow > 0 {
+				fmt.Fprintf(ctx.stderr, "pu recover: timed out after %s waiting for CH32V003 POR SWIO catch\n", waitWindow)
+				return 1
+			}
+		}
+	}
+
 	fmt.Fprintf(ctx.stdout, "CH32V003 Guided Power-Cycle Unbrick (Probe %s):\n", probe.Serial)
-	fmt.Fprintln(ctx.stdout, "  1. Verify GND is shared and a 1 kΩ pull-up resistor connects SWIO (PD1) to 3.3 V (required on Pico dev board).")
-	fmt.Fprintln(ctx.stdout, "  2. Disconnect CH32V003 VDD (3.3 V) for 2 seconds to clear any PD1 GPIO sketch remap or brownout latch.")
-	fmt.Fprintln(ctx.stdout, "  3. Reconnect CH32V003 VDD while immediately running 'pu upload --family ch32v003 --file <clean.elf>' FIRST to halt and replace firmware before user code executes.")
+	fmt.Fprintln(ctx.stdout, "  1. Verify GND is shared and a 430 Ω – 2.2 kΩ pull-up resistor connects SWIO (PD1) to 3.3 V (required on Pico dev board).")
+	fmt.Fprintln(ctx.stdout, "  2. Run 'pu recover --family ch32v003 --wait 10s' and disconnect/reconnect CH32V003 VDD (3.3 V) during the window (or wire Pico GP6 to PD7/NRST).")
+	fmt.Fprintln(ctx.stdout, "  3. Once caught and halted, run 'pu upload --family ch32v003 --file <clean.elf>' FIRST to replace firmware before user code executes.")
 	fmt.Fprintln(ctx.stdout, "  4. Verify recovery with 'pu check --family ch32v003'.")
 	return 0
 }

@@ -42,7 +42,7 @@ namespace {
 
 constexpr uint32_t kWatchdogTimeoutMs = 4000u;
 constexpr size_t kDapQueueDepth = 8u;
-constexpr size_t kSwioRingCap = 1024u;
+constexpr size_t kSwioRingCap = 4096u;
 
 struct DapPacketSlot {
     uint8_t data[PU_DAP_PACKET_SIZE];

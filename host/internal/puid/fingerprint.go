@@ -808,8 +808,13 @@ func isHexByte(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
-func exchangeCH32PUID1(port io.ReadWriter) (string, error) {
-	deadline := time.Now().Add(2 * time.Second)
+// ExchangeCH32MonitorCmd sends a framed GDB RSP `qRcmd,<hex>` monitor command over a
+// CH32V003 SWIO CDC stream and decodes the hex-encoded reply within timeout.
+func ExchangeCH32MonitorCmd(port io.ReadWriter, monitorCmd string, timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
 	if rd, ok := port.(interface{ SetReadDeadline(time.Time) error }); ok {
 		_ = rd.SetReadDeadline(deadline)
 	}
@@ -817,14 +822,14 @@ func exchangeCH32PUID1(port io.ReadWriter) (string, error) {
 		_ = wd.SetWriteDeadline(deadline)
 	}
 
-	req := []byte(BuildGDBQRcmdPacket("puid1"))
+	req := []byte(BuildGDBQRcmdPacket(monitorCmd))
 	for written := 0; written < len(req); {
 		n, err := port.Write(req[written:])
 		if n > 0 {
 			written += n
 		}
 		if err != nil {
-			return "", fmt.Errorf("puid: write qRcmd puid1 packet: %w", err)
+			return "", fmt.Errorf("puid: write qRcmd %s packet: %w", monitorCmd, err)
 		}
 	}
 
@@ -913,6 +918,10 @@ func exchangeCH32PUID1(port io.ReadWriter) (string, error) {
 			return "", fmt.Errorf("puid: read CH32V003 PUID1 RSP reply: %w", rErr)
 		}
 	}
+}
+
+func exchangeCH32PUID1(port io.ReadWriter) (string, error) {
+	return ExchangeCH32MonitorCmd(port, "puid1", 2*time.Second)
 }
 
 func isCtrlReplyStatus(err error, status byte) bool {

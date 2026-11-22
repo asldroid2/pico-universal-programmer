@@ -74,7 +74,10 @@ pu export-vscode --family stm32f4 --out-dir .
 ### Recovering a Locked / Bricked MCU
 - **CH32V003 (PD1 remapped to GPIO or read-protected):**
   ```bash
+  # Pro PCB (automatic VTARG power-cycle) or Pico with GP6 -> PD7/NRST wired:
   pu recover --family ch32v003
+  # Off-the-shelf Pico without NRST wired (catches POR while you power-cycle VDD):
+  pu recover --family ch32v003 --wait 10s
   pu upload --family ch32v003 --file clean_blink.elf
   ```
 - **STM32 (SWD disabled or RDP locked):**

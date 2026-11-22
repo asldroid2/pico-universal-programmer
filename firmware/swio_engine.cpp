@@ -218,8 +218,10 @@ uint s_pio_offset = 0u;
 
 uint32_t compute_swio_clkdiv_q16_8(uint32_t sys_hz) {
     const uint32_t effective_sys = (sys_hz != 0u) ? sys_hz : 125000000u;
-    /* Target 16 MHz PIO clock -> 1 PIO cycle = 62.5 ns = 0.5T (T = 125 ns) */
-    uint64_t div_q16_8 = ((uint64_t)effective_sys * 256ull + 16000000ull - 1ull) / 16000000ull;
+    /* Target ~10.42 MHz PIO clock (clkdiv=12.0 at 125 MHz -> 96 ns/cyc, 288 ns '1' low,
+     * 656 ns RX sample): centered in empirically characterized CH32V003 silicon window. */
+    constexpr uint64_t kTargetPioHz = 10416667ull;
+    uint64_t div_q16_8 = ((uint64_t)effective_sys * 256ull + kTargetPioHz - 1ull) / kTargetPioHz;
     if (div_q16_8 < 256ull) {
         div_q16_8 = 256ull;
     } else if (div_q16_8 > 0xFFFFFFull) {
@@ -293,12 +295,12 @@ void rp2040_swio_bus_reset() {
     pio_sm_set_enabled(pio1, kSwioPioSm, false);
     pio_sm_clear_fifos(pio1, kSwioPioSm);
 
-    /* Hold SWIO open-drain LOW for >= 40 us (> 128T) to reset target SWIO shift logic */
+    /* Hold SWIO open-drain LOW for 300 us (>= 256T even at 8 MHz / TDIV=3 cold boot) */
     pio_sm_set_pins_with_mask(pio1, kSwioPioSm, 0u, (1u << PU_PIN_SWIO));
     pio_sm_set_consecutive_pindirs(pio1, kSwioPioSm, PU_PIN_SWIO, 1u, true);
-    busy_wait_us_32(40u);
+    busy_wait_us_32(300u);
     pio_sm_set_consecutive_pindirs(pio1, kSwioPioSm, PU_PIN_SWIO, 1u, false);
-    busy_wait_us_32(10u);
+    busy_wait_us_32(20u);
 
     pio_sm_exec(pio1, kSwioPioSm, pio_encode_jmp(s_pio_offset + pu_swio_offset_frame_start));
     pio_sm_set_enabled(pio1, kSwioPioSm, true);
@@ -1077,14 +1079,30 @@ DmStateClass classify_dmstatus(uint32_t dmstatus) {
 }
 
 bool enable_swio_link_and_dm() {
-    if (!wire_write(kWchDmShdwCfgr, kWchCfgrKey | kWchCfgrOutEnBit)) {
-        return false;
-    }
-    if (!wire_write(kWchDmCfgr, kWchCfgrKey | kWchCfgrOutEnBit)) {
-        return false;
-    }
-    if (!wire_write(kDmControl, kDmCtrlDmActive)) {
-        return false;
+    const uint32_t max_tries = (s_wire.bus_reset != nullptr) ? 4u : 1u;
+    for (uint32_t attempt = 0u; attempt < max_tries; ++attempt) {
+        if (attempt > 0u && s_wire.bus_reset != nullptr) {
+            s_wire.bus_reset();
+        }
+        /* Write SHDWCFGR + CFGR + DMCONTROL twice so SDI wake-up edge never drops OUTEN=1 */
+        if (!wire_write(kWchDmShdwCfgr, kWchCfgrKey | kWchCfgrOutEnBit) ||
+            !wire_write(kWchDmCfgr, kWchCfgrKey | kWchCfgrOutEnBit) ||
+            !wire_write(kWchDmShdwCfgr, kWchCfgrKey | kWchCfgrOutEnBit) ||
+            !wire_write(kWchDmCfgr, kWchCfgrKey | kWchCfgrOutEnBit) ||
+            !wire_write(kDmControl, kDmCtrlDmActive) ||
+            !wire_write(kDmControl, kDmCtrlDmActive)) {
+            return false;
+        }
+        if (max_tries == 1u) {
+            return true;
+        }
+        uint32_t cfgr = 0xFFFFFFFFu;
+        if (!wire_read(kWchDmCfgr, &cfgr)) {
+            return false;
+        }
+        if (cfgr != 0xFFFFFFFFu && (cfgr & kWchCfgrOutEnBit) != 0u) {
+            return true;
+        }
     }
     return true;
 }
@@ -1149,12 +1167,42 @@ bool dm_write_reg(uint16_t regno, uint32_t val) {
     return wire_write(kDmCommand, cmd) && wait_abstract_ready();
 }
 
+bool s_progbuf_cache_valid = false;
+uint32_t s_progbuf0_cached = 0u;
+uint32_t s_progbuf1_cached = 0u;
+
+void invalidate_progbuf_cache() {
+    s_progbuf_cache_valid = false;
+    s_progbuf0_cached = 0u;
+    s_progbuf1_cached = 0u;
+}
+
+bool set_progbuf_pair(uint32_t insn0, uint32_t insn1) {
+    if (!s_progbuf_cache_valid || s_progbuf0_cached != insn0) {
+        if (!wire_write(kDmProgBuf0, insn0)) {
+            invalidate_progbuf_cache();
+            return false;
+        }
+        s_progbuf0_cached = insn0;
+    }
+    if (!s_progbuf_cache_valid || s_progbuf1_cached != insn1) {
+        if (!wire_write(kDmProgBuf1, insn1)) {
+            invalidate_progbuf_cache();
+            return false;
+        }
+        s_progbuf1_cached = insn1;
+    }
+    s_progbuf_cache_valid = true;
+    return true;
+}
+
 struct ScopedScratchRegs {
     bool valid = false;
     uint32_t saved_x8 = 0u;
     uint32_t saved_x9 = 0u;
 
     bool save() {
+        invalidate_progbuf_cache();
         if (!dm_read_reg(kRegX8, &saved_x8) || !dm_read_reg(kRegX9, &saved_x9)) {
             return false;
         }
@@ -1172,6 +1220,7 @@ struct ScopedScratchRegs {
         (void)wire_write(kDmProgBuf0, kInsnEbreak);
         (void)wire_write(kDmProgBuf1, kInsnEbreak);
         (void)wire_write(kDmData0, 0u);
+        invalidate_progbuf_cache();
         return ok8 && ok9;
     }
 
@@ -1181,8 +1230,7 @@ struct ScopedScratchRegs {
 };
 
 bool exec_load_with_saved_scratch(uint32_t load_insn, uint32_t addr, uint32_t *out_val) {
-    if (!wire_write(kDmProgBuf0, load_insn) ||
-        !wire_write(kDmProgBuf1, kInsnEbreak) ||
+    if (!set_progbuf_pair(load_insn, kInsnEbreak) ||
         !wire_write(kDmData0, addr)) {
         return false;
     }
@@ -1195,8 +1243,7 @@ bool exec_load_with_saved_scratch(uint32_t load_insn, uint32_t addr, uint32_t *o
 
 bool exec_store_with_saved_scratch(uint32_t store_insn, uint32_t addr, uint32_t val) {
     if (!dm_write_reg(kRegX9, val) ||
-        !wire_write(kDmProgBuf0, store_insn) ||
-        !wire_write(kDmProgBuf1, kInsnEbreak) ||
+        !set_progbuf_pair(store_insn, kInsnEbreak) ||
         !wire_write(kDmData0, addr)) {
         return false;
     }
@@ -1236,8 +1283,25 @@ bool halt_target_bounded(uint64_t start_us) {
     return false;
 }
 
+bool reset_cpu_and_halt(uint64_t start_us) {
+    invalidate_progbuf_cache();
+    if (!wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlNdmReset | kDmCtrlDmActive) ||
+        !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlDmActive) ||
+        !halt_target_bounded(start_us) ||
+        !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive) ||
+        !wire_write(kDmControl, kDmCtrlDmActive)) {
+        return false;
+    }
+    return true;
+}
+
 bool resume_target_and_verify(uint64_t start_us) {
     const uint64_t t0 = wire_now_us(start_us);
+    uint32_t pre_status = 0u;
+    if (wire_read(kDmStatus, &pre_status) && (pre_status & kDmStatAnyHaveReset) != 0u) {
+        (void)wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive);
+        (void)wire_write(kDmControl, kDmCtrlDmActive);
+    }
     if (!wire_write(kDmControl, kDmCtrlResumeReq | kDmCtrlDmActive)) {
         return false;
     }
@@ -1247,8 +1311,9 @@ bool resume_target_and_verify(uint64_t start_us) {
         if (!wire_read(kDmStatus, &dmstatus)) {
             return false;
         }
-        if (classify_dmstatus(dmstatus) == DmStateClass::kRunning &&
-            (dmstatus & kDmStatAllResumeAck) != 0u) {
+        /* Real QingKe V2A silicon transitions DMSTATUS directly to 0x004C0C82
+         * (ALLRUNNING=1, ANYRUNNING=1) without asserting ALLRESUMEACK. */
+        if (classify_dmstatus(dmstatus) == DmStateClass::kRunning) {
             saw_running = true;
             break;
         }
@@ -1275,6 +1340,11 @@ bool resume_target_for_gdb(uint64_t start_us, DmStateClass *out_state) {
         return false;
     }
     const uint64_t t0 = wire_now_us(start_us);
+    uint32_t pre_status = 0u;
+    if (wire_read(kDmStatus, &pre_status) && (pre_status & kDmStatAnyHaveReset) != 0u) {
+        (void)wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive);
+        (void)wire_write(kDmControl, kDmCtrlDmActive);
+    }
     uint32_t dcsr = 0u;
     if (dm_read_reg(kRegDcsr, &dcsr)) {
         const uint32_t want_dcsr = (dcsr & ~kDcsrStepBit) | kDcsrEbreakM;
@@ -1292,10 +1362,21 @@ bool resume_target_for_gdb(uint64_t start_us, DmStateClass *out_state) {
             return false;
         }
         const DmStateClass cls = classify_dmstatus(dmstatus);
-        if ((dmstatus & kDmStatAllResumeAck) != 0u &&
-            (cls == DmStateClass::kRunning || cls == DmStateClass::kHalted)) {
-            acked_state = cls;
+        if (cls == DmStateClass::kRunning) {
+            acked_state = DmStateClass::kRunning;
             break;
+        }
+        if (cls == DmStateClass::kHalted) {
+            if ((dmstatus & kDmStatAllResumeAck) != 0u) {
+                acked_state = DmStateClass::kHalted;
+                break;
+            }
+            uint32_t post_dcsr = 0u;
+            if (dm_read_reg(kRegDcsr, &post_dcsr) &&
+                ((post_dcsr >> 6u) & 0x7u) == 1u /* CSR_DCSR_CAUSE_EBREAK */) {
+                acked_state = DmStateClass::kHalted;
+                break;
+            }
         }
         const uint64_t now = wire_now_us(t0 + static_cast<uint64_t>(i + 1u) * 100u);
         if ((now >= t0) && ((now - t0) >= PU_SWIO_CHECK_TIMEOUT_US)) {
@@ -1965,6 +2046,10 @@ bool ensure_gdb_target_halted(uint64_t now_us) {
         s_target_attached_halted = false;
         return false;
     }
+    if ((dmstatus & kDmStatAnyHaveReset) != 0u) {
+        (void)wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive);
+        (void)wire_write(kDmControl, kDmCtrlDmActive);
+    }
     s_gdb_running = false;
     if (!s_target_attached_halted) {
         uint32_t dcsr = 0u;
@@ -2219,14 +2304,76 @@ void handle_qrcmd(PktCursor &cur, uint64_t now_us) {
             return;
         }
         clear_vflash_cache();
+        s_target_attached_halted = false;
         if (!restore_all_soft_breakpoints(now_us) ||
-            !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlNdmReset | kDmCtrlDmActive) ||
-            !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive) ||
+            !reset_cpu_and_halt(now_us) ||
             !ensure_gdb_target_halted(now_us)) {
             tx_enqueue_cstr_packet("E01");
             return;
         }
         tx_enqueue_cstr_packet("OK");
+        return;
+    }
+
+    if (ascii_iequals(trimmed, trimmed_len, "unbrick")) {
+        if (s_gdb_session_open) {
+            encode_ascii_as_hex_packet("UNBRICK:ERR_ENGINE_BUSY\n");
+            return;
+        }
+        const pu_status_t acq = pu_engine_acquire(PU_ENGINE_RECOVERY, now_us, PU_SWIO_RECOVERY_TIMEOUT_US);
+        if (acq == PU_ERR_ENGINE_BUSY) {
+            encode_ascii_as_hex_packet("UNBRICK:ERR_ENGINE_BUSY\n");
+            return;
+        }
+        if (acq == PU_ERR_FAULT_LATCHED) {
+            encode_ascii_as_hex_packet("UNBRICK:ERR_FAULT_LATCHED\n");
+            return;
+        }
+        if (acq != PU_OK) {
+            encode_ascii_as_hex_packet("UNBRICK:ERR_TIMEOUT\n");
+            return;
+        }
+
+        wire_bus_open();
+#if !defined(PU_HOST_TEST)
+        /* Pulse NRST (GP6 -> PD7 if wired) LOW for 10 ms then release into POR catch loop */
+        gpio_init(PU_PIN_TARGET_NRST);
+        gpio_put(PU_PIN_TARGET_NRST, false);
+        gpio_set_dir(PU_PIN_TARGET_NRST, GPIO_OUT);
+        busy_wait_us_32(10000u);
+        gpio_set_dir(PU_PIN_TARGET_NRST, GPIO_IN);
+        gpio_pull_up(PU_PIN_TARGET_NRST);
+#endif
+        const uint64_t t0 = wire_now_us(now_us);
+        bool caught = false;
+        for (uint32_t attempt = 0u; attempt < 4096u; ++attempt) {
+            if (pu_engine_current() == PU_ENGINE_FAULT) {
+                wire_bus_close();
+                encode_ascii_as_hex_packet("UNBRICK:ERR_FAULT_LATCHED\n");
+                return;
+            }
+            const uint64_t cur = wire_now_us(t0 + static_cast<uint64_t>(attempt + 1u) * 50u);
+            (void)pu_engine_renew_deadline(PU_ENGINE_RECOVERY, cur, PU_SWIO_RECOVERY_TIMEOUT_US);
+            if (s_wire.bus_reset != nullptr && ((attempt & 0x7u) == 0u)) {
+                s_wire.bus_reset();
+            }
+            (void)wire_write(kWchDmShdwCfgr, kWchCfgrKey | kWchCfgrOutEnBit);
+            (void)wire_write(kWchDmCfgr, kWchCfgrKey | kWchCfgrOutEnBit);
+            if (wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlDmActive)) {
+                uint32_t dmst = 0u;
+                if (wire_read(kDmStatus, &dmst) &&
+                    classify_dmstatus(dmst) == DmStateClass::kHalted) {
+                    caught = reset_cpu_and_halt(cur);
+                    break;
+                }
+            }
+            if ((cur >= t0) && ((cur - t0) >= PU_SWIO_RECOVERY_TIMEOUT_US)) {
+                break;
+            }
+        }
+        wire_bus_close();
+        (void)pu_engine_release(PU_ENGINE_RECOVERY);
+        encode_ascii_as_hex_packet(caught ? "UNBRICK:OK\n" : "UNBRICK:ERR_TIMEOUT\n");
         return;
     }
 
@@ -2243,7 +2390,10 @@ void handle_valid_gdb_packet(uint64_t now_us) {
         "<property name=\"blocksize\">0x40</property></memory>"
         "<memory type=\"flash\" start=\"0x08000000\" length=\"0x4000\">"
         "<property name=\"blocksize\">0x40</property></memory>"
+        "<memory type=\"rom\" start=\"0x1ffff000\" length=\"0x1000\"/>"
         "<memory type=\"ram\" start=\"0x20000000\" length=\"0x800\"/>"
+        "<memory type=\"ram\" start=\"0x40000000\" length=\"0x28000\"/>"
+        "<memory type=\"ram\" start=\"0xe0000000\" length=\"0x100000\"/>"
         "</memory-map>";
 
     PktCursor cur{s_rx_buf, s_rx_len, 0u, false};
@@ -2281,18 +2431,16 @@ void handle_valid_gdb_packet(uint64_t now_us) {
         return;
     }
 
-    /* Unsupported hardware breakpoints: MUST return empty reply ($#00) per GDB RSP */
-    if (cur.match_prefix("Z1,") || cur.match_prefix("z1,")) {
-        tx_enqueue_cstr_packet("");
-        return;
-    }
-
     if (cur.match_prefix("qSupported")) {
-        tx_enqueue_cstr_packet("PacketSize=7ff;qXfer:memory-map:read+");
+        tx_enqueue_cstr_packet("PacketSize=3ff;qXfer:memory-map:read+");
         return;
     }
     if (cur.match_exact("vMustReplyEmpty")) {
         tx_enqueue_cstr_packet("");
+        return;
+    }
+    if (cur.match_exact("!")) {
+        tx_enqueue_cstr_packet("OK");
         return;
     }
     if (cur.match_prefix("Hg") || cur.match_prefix("Hc")) {
@@ -2550,7 +2698,9 @@ void handle_valid_gdb_packet(uint64_t now_us) {
         return;
     }
 
-    if (cur.match_prefix("Z0,")) {
+    /* QingKe V2A has zero hardware trigger comparators; GDB 10..16 converts 'break' inside
+     * <memory type="flash"> into Z1/z1 automatically, so route both Z0/Z1 to SoftBreak. */
+    if (cur.match_prefix("Z0,") || cur.match_prefix("Z1,")) {
         const uint32_t addr = cur.take_hex_u32();
         cur.take_char(',');
         const uint32_t kind = cur.take_hex_u32();
@@ -2566,7 +2716,7 @@ void handle_valid_gdb_packet(uint64_t now_us) {
         return;
     }
 
-    if (cur.match_prefix("z0,")) {
+    if (cur.match_prefix("z0,") || cur.match_prefix("z1,")) {
         const uint32_t addr = cur.take_hex_u32();
         cur.take_char(',');
         const uint32_t kind = cur.take_hex_u32();
@@ -3269,10 +3419,7 @@ pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us) {
     if (!caught) {
         return PU_ERR_TIMEOUT;
     }
-    if (!wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlNdmReset | kDmCtrlDmActive) ||
-        !wire_write(kDmControl, kDmCtrlHaltReq | kDmCtrlAckHaveReset | kDmCtrlDmActive) ||
-        !halt_target_bounded(now_us) ||
-        !wire_write(kDmControl, kDmCtrlDmActive)) {
+    if (!reset_cpu_and_halt(now_us)) {
         return PU_ERR_TIMEOUT;
     }
     /* Do NOT call reset_interface_to_power_on(): leave chip HALTED with DMACTIVE=1. */
@@ -3280,6 +3427,7 @@ pu_status_t pu_ch32_power_cycle_unbrick(uint64_t now_us) {
 }
 
 void pu_ch32_on_disconnect(void) {
+    invalidate_progbuf_cache();
     clear_vflash_cache();
     const uint64_t now = wire_now_us(0u);
     const bool had_bps = has_unrestored_soft_breakpoints();

@@ -58,13 +58,13 @@
 | `rp2040` | Raspberry Pi Pico / Pico W | Windows 10/11 | Pending | Pending | Pending | Pending | Pending | Pending | `PENDING_PHYSICAL_HIL` |
 | `esp32` | ESP32-WROOM-32 (Zbit QIO) | Linux | Pending | Pending | Pending | Pending | Pending | Pending | `PENDING_PHYSICAL_HIL` |
 | `esp32` | ESP32-WROOM-32 (Zbit QIO) | Windows 10/11 | Pending | Pending | Pending | Pending | Pending | Pending | `PENDING_PHYSICAL_HIL` |
-| `ch32v003` | CH32V003F4P6 Dev Board | Linux | Pending | Pending | Pending | Pending | Pending | Pending | `PENDING_PHYSICAL_HIL` |
+| `ch32v003` | CH32V003F4P6 (16 KiB, `0x00300510`, UID `0xB9B9ABCD`) | Linux | **PASS** (`2e8a:1050`) | **PASS** (`OK`, 16 KiB) | **PASS** (`100/100`, 4.93s mean) | **PASS** (DWARF `break`, cross-page 4B SoftBreak, `next`, RAM/MMIO, `SIGKILL` auto-restore) | **PASS** (15.7 ms) | `docs/hil_reports/track_a_ch32v003_linux.json` (`uf2`: `4ef6b7c9…`, `pu`: `2c874ec7…`) | **`QUALIFIED_PASS`** |
 | `ch32v003` | CH32V003F4P6 Dev Board | Windows 10/11 | Pending | Pending | Pending | Pending | Pending | Pending | `PENDING_PHYSICAL_HIL` |
 
 ### 2.3 Physical Fault-Injection & Recovery Checklist (Track A)
 
-- [x] **Mid-flash USB unplug recovery:** Unplug target or kill OpenOCD/GDB mid-session → probe returns pins to Hi-Z within deadline and next `pu upload` succeeds without replugging probe. *(Verified on STM32F407VET6 via mid-session `SIGKILL` + 5s lease expiry auto-recovery.)*
-- [x] **Simultaneous USB contention:** Hold CH32V003 GDB session open on IF 1–2 while issuing STM32 OpenOCD `pu check` on IF 0 → immediate `DAP_ERROR` / busy rejection without corrupting active GDB session. *(Verified live via `engine_owner` `ERR_ENGINE_BUSY` rejection across IF 0 and IF 1–2/IF 5.)*
+- [x] **Mid-flash USB unplug recovery:** Unplug target or kill OpenOCD/GDB mid-session → probe returns pins to Hi-Z within deadline and next `pu upload` succeeds without replugging probe. *(Verified on STM32F407VET6 via mid-session `SIGKILL` + 5s lease expiry auto-recovery, and on CH32V003F4P6 via mid-session `SIGKILL` automatic single-page & cross-page flash SoftBreak restoration.)*
+- [x] **Simultaneous USB contention:** Hold CH32V003 GDB session open on IF 1–2 while issuing STM32 OpenOCD `pu check` on IF 0 → immediate `DAP_ERROR` / busy rejection without corrupting active GDB session. *(Verified live with real CH32V003F4P6 GDB session on `/dev/ttyACM0` rejecting concurrent `pu check --family stm32f4` with `ERR_ENGINE_BUSY`.)*
 - [ ] **CH32V003 silent-bus diagnostics:** Test disconnected wire (`0xFFFFFFFF`) and shorted-to-GND wire (`0x00000000`) → `pu check --family ch32v003` emits `ERR_NO_REPLY` with all 5 causes.
 - [ ] **CH32V003 PD1-reused recovery:** Flash sketch remapping `PD1` to GPIO output → recover via `pu recover --family ch32v003` + `pu upload`.
 - [x] **Concurrent Target UART:** Stream 115.2 kbps and 2 Mbps UART traffic on IF 3–4 during active STM32/ESP32 flashing with zero data loss or USB stall. *(Verified 10/10 concurrent `/dev/ttyACM1` 115.2 kbps UART + STM32F407VET6 SWD uploads at 2 MHz with `uart_rx_drop=0`.)*

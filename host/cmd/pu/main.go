@@ -78,6 +78,7 @@ type cliContext struct {
 	ctrlTransceiver func(probe usbprobe.ProbeDevice, req []byte) ([]byte, error)
 	onGDBListen     func(net.Addr)
 	globalPID       string
+	hasFakeDiscover bool
 }
 
 type subcommandFunc func(ctx cliContext, args []string) int
@@ -197,6 +198,7 @@ func runWithEnv(args []string, env cliEnv) int {
 		ctrlTransceiver: env.ctrlTransceiver,
 		onGDBListen:     env.onGDBListen,
 		globalPID:       *pidFlag,
+		hasFakeDiscover: env.discoverProbes != nil,
 	}
 
 	sub := rest[0]

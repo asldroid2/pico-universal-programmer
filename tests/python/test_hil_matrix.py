@@ -70,6 +70,16 @@ class TestHILMatrixRunner(unittest.TestCase):
         self.assertTrue(report["cross_family_switch"]["passed"])
         self.assertTrue(report["summary"]["overall_passed"])
 
+    def test_single_ch32v003_family_selection_passes_switch_gate(self) -> None:
+        report = run_hil_matrix.run_qualification(
+            mode="dry-run",
+            pu_bin="pu",
+            families=["ch32v003"],
+            cycles=2,
+        )
+        self.assertTrue(report["cross_family_switch"]["passed"])
+        self.assertTrue(report["summary"]["overall_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

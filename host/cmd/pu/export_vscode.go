@@ -207,16 +207,16 @@ func buildVSCodeLaunchConfig(family, serial, pidHex, elfPath string) map[string]
 			extraArgs += " --pid " + pidHex
 		}
 		return map[string]any{
-			"name":               "Pico Universal Debug (ch32v003 SWIO)",
-			"type":               "cortex-debug",
-			"request":            "launch",
-			"servertype":         "external",
-			"cwd":                "${workspaceFolder}",
-			"executable":         elfPath,
-			"gdbPath":            "riscv-none-elf-gdb",
-			"gdbTarget":          fmt.Sprintf(`| "%s" gdb-pipe --family ch32v003%s`, puExe, extraArgs),
-			"runToEntryPoint":    "main",
-			"postLaunchCommands": []string{"set breakpoint auto-hw off"},
+			"name":              "Pico Universal Debug (ch32v003 SWIO)",
+			"type":              "cortex-debug",
+			"request":           "launch",
+			"servertype":        "external",
+			"cwd":               "${workspaceFolder}",
+			"executable":        elfPath,
+			"gdbPath":           "riscv-none-elf-gdb",
+			"gdbTarget":         fmt.Sprintf(`| "%s" gdb-pipe --family ch32v003%s`, puExe, extraArgs),
+			"runToEntryPoint":   "main",
+			"preLaunchCommands": []string{"set remotetimeout 20"},
 		}
 	}
 

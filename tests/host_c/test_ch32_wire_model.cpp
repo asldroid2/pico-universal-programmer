@@ -239,11 +239,11 @@ void test_ch32_softbreak_cross_page_and_disconnect_restore() {
     assert(pu_ch32_gdb_send_checked("$z0,08003ffe,2#", out, sizeof(out), 4240u) == PU_OK);
     assert(pu_ch32_gdb_send_checked("$z0,08003ffe,2#", out, sizeof(out), 4250u) == PU_OK);
 
-    /* 3. Z1 / z1 hardware breakpoints return empty unsupported reply ($#00) */
-    assert(pu_ch32_gdb_send_checked("$Z1,08000000,2#", out, sizeof(out), 4300u) == PU_OK);
-    assert(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out))).empty());
-    assert(pu_ch32_gdb_send_checked("$z1,08000000,2#", out, sizeof(out), 4310u) == PU_OK);
-    assert(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out))).empty());
+    /* 3. Z1 / z1 flash breakpoints route to SoftBreak for GDB 10..16 <memory type="flash"> compatibility */
+    assert(pu_ch32_gdb_send_checked("$Z1,08000080,2#", out, sizeof(out), 4300u) == PU_OK);
+    assert(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out))) == "OK");
+    assert(pu_ch32_gdb_send_checked("$z1,08000080,2#", out, sizeof(out), 4310u) == PU_OK);
+    assert(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out))) == "OK");
 
     /* Stage partial vFlashWrite data before disconnect to confirm cache cleanup */
     assert(pu_ch32_gdb_send_checked("$vFlashWrite:08000100:\xAA\xBB#", out, sizeof(out), 4350u) == PU_OK);
@@ -423,6 +423,7 @@ struct SiliconHalModel {
     bool bus_is_open = false;
     uint32_t bus_close_count = 0u;
     bool resume_halts_immediately = false;
+    bool suppress_resume_ack = false;
     bool por_unbrick_mode = false;
     bool powered = true;
     bool pd1_bricked = false;
@@ -531,7 +532,7 @@ bool si_read_reg(uint8_t reg_addr, uint32_t *out_val, uint32_t /*timeout_us*/) {
         if (g_si.have_reset) {
             st |= (1u << 19) | (1u << 18);
         }
-        if (g_si.resume_ack) {
+        if (g_si.resume_ack && !g_si.suppress_resume_ack) {
             st |= (1u << 17) | (1u << 16);
         }
         if (g_si.halted) {
@@ -1349,6 +1350,74 @@ void test_ch32_pio_cycle_accurate_timing() {
     assert(rx_out == 0x004C0C82u);
 }
 
+void test_ch32_qingke_v2a_no_resumeack_extended_rsp_and_qrcmd_unbrick() {
+    uint8_t out[1536] = {};
+
+    /* 1. Real QingKe V2A silicon transitions DMSTATUS from 0x004C0382 -> 0x004C0C82
+     *    (ALLRUNNING=1, ALLRESUMEACK=0) on RESUMEREQ: verify PUID1 check + GDB continue! */
+    g_si = SiliconHalModel{};
+    g_si.suppress_resume_ack = true;
+    g_si.have_reset = true;
+    pu_swio_wire_hal_t hal = {};
+    hal.sys_clock_hz = 125000000u;
+    hal.bus_open = si_bus_open;
+    hal.bus_close = si_bus_close;
+    hal.read_reg = si_read_reg;
+    hal.write_reg = si_write_reg;
+    hal.now_us = si_now_us;
+    pu_swio_init(&hal);
+
+    pu_ch32_check_result_t r_chk = pu_ch32_non_destructive_check(70000000u);
+    assert(r_chk.status == PU_CH32_OK);
+    assert(r_chk.resumed_running == true);
+    assert(r_chk.outen_disabled_verified == true);
+
+    /* Extended-remote '!' must return OK; memory-map must expose ROM/MMIO/PFIC regions */
+    assert(pu_ch32_gdb_send_checked("$!#", out, sizeof(out), 70001000u) == PU_OK);
+    assert(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out))) == "OK");
+
+    assert(pu_ch32_gdb_send_checked("$qXfer:memory-map:read::0,3fa#", out, sizeof(out), 70001500u) == PU_OK);
+    const std::string mmap = extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out)));
+    assert(mmap.find("0x1ffff000") != std::string::npos);
+    assert(mmap.find("0x40000000") != std::string::npos);
+    assert(mmap.find("0xe0000000") != std::string::npos);
+
+    /* GDB continue ('c') with ALLRESUMEACK=0 enters running cleanly */
+    const std::string cont_pkt = frame_gdb_packet("c");
+    size_t n = pu_ch32_gdb_feed(reinterpret_cast<const uint8_t *>(cont_pkt.data()),
+                                cont_pkt.size(), out, sizeof(out), 70002000u);
+    assert(n == 1u && out[0] == '+');
+    pu_ch32_on_disconnect();
+
+    /* Fast breakpoint hit with ALLRESUMEACK=0 & DCSR.CAUSE == 1 (EBREAK) emits immediate T05 */
+    g_si = SiliconHalModel{};
+    g_si.suppress_resume_ack = true;
+    g_si.resume_halts_immediately = true;
+    g_si.dcsr = (1u << 6); /* CSR_DCSR_CAUSE_EBREAK */
+    pu_swio_init(&hal);
+    assert(pu_ch32_gdb_send_checked("$?#", out, sizeof(out), 70003000u) == PU_OK);
+    n = pu_ch32_gdb_feed(reinterpret_cast<const uint8_t *>(cont_pkt.data()),
+                         cont_pkt.size(), out, sizeof(out), 70003500u);
+    assert(n > 1u && out[0] == '+');
+    assert(extract_gdb_payload(out, n) == "T05");
+    pu_ch32_on_disconnect();
+
+    /* 2. Track A qRcmd,unbrick ("756e627269636b") catches target, leaves HALTED, and honors contention/fault */
+    pu_swio_set_fake_wire_mode(PU_WIRE_HEALTHY_CH32V003);
+    assert(pu_engine_acquire(PU_ENGINE_SWD, 71000000u, 500000u) == PU_OK);
+    assert(pu_ch32_gdb_send_checked("$qRcmd,756e627269636b#", out, sizeof(out), 71000100u) == PU_OK);
+    assert(decode_hex_ascii(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out)))) ==
+           "UNBRICK:ERR_ENGINE_BUSY\n");
+    assert(pu_engine_release(PU_ENGINE_SWD) == PU_OK);
+
+    assert(pu_ch32_gdb_send_checked("$qRcmd,756e627269636b#", out, sizeof(out), 71001000u) == PU_OK);
+    assert(decode_hex_ascii(extract_gdb_payload(out, std::strlen(reinterpret_cast<const char *>(out)))) ==
+           "UNBRICK:OK\n");
+    assert(pu_engine_current() == PU_ENGINE_IDLE);
+    assert(pu_ch32_non_destructive_check(71002000u).status == PU_CH32_ERR_ALREADY_HALTED);
+    pu_ch32_on_disconnect();
+}
+
 } // namespace
 
 int main() {
@@ -1369,6 +1438,7 @@ int main() {
     test_ch32_tx_ring_wraparound_and_backpressure();
     test_ch32_unbrick_vtarg_guard_por_catch_and_dmactive();
     test_ch32_pio_cycle_accurate_timing();
+    test_ch32_qingke_v2a_no_resumeack_extended_rsp_and_qrcmd_unbrick();
     std::puts("test_ch32_wire_model: all checks passed");
     return 0;
 }

@@ -750,7 +750,7 @@ func buildDebugCustomEntries(tc *catalog.TargetsCatalog, family string, profileN
 			}
 			entry["servertype"] = "external"
 			entry["gdbTarget"] = fmt.Sprintf(`| "%s" gdb-pipe --family %s%s`, puExeSlash, family, pidFlag)
-			entry["postLaunchCommands"] = []string{"set breakpoint auto-hw off"}
+			entry["preLaunchCommands"] = []string{"set remotetimeout 20"}
 		default:
 			entry["servertype"] = "openocd"
 			entry["interface"] = prof.Transport

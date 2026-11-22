@@ -442,14 +442,15 @@ func TestUploadAtomicCH32V003GDBBatchAndReadbackVerify(t *testing.T) {
 
 	gdbArgs := strings.Join(runner.ran[0].Args, " | ")
 	for _, want := range []string{
-		"set breakpoint auto-hw off",
+		"set remotetimeout 20",
 		`file "`,
 		`fw_ch32 blink space.elf"`,
-		"target extended-remote /dev/ttyACM0",
+		"target remote /dev/ttyACM0",
 		"load",
 		"compare-sections",
 		"monitor reset",
 		"detach",
+		"quit",
 	} {
 		if !strings.Contains(gdbArgs, want) {
 			t.Fatalf("missing %q in CH32 GDB batch args: %s", want, gdbArgs)

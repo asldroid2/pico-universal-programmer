@@ -346,6 +346,38 @@ func TestPURecoverCH32AndSTM32MassErase(t *testing.T) {
 		t.Fatalf("expected guided power-cycle unbrick instructions on Pico dev profile, got code=%d out=%s", code, out.String())
 	}
 
+	// 2b. Track A (PU_BOARD_PICO) active CDC qRcmd,unbrick NRST/POR catch when portOpener is available
+	unbrickSrv, unbrickCli := net.Pipe()
+	go func() {
+		defer unbrickSrv.Close()
+		buf := make([]byte, 128)
+		n, _ := unbrickSrv.Read(buf)
+		if strings.Contains(string(buf[:n]), "756e627269636b") {
+			payload := fmt.Sprintf("%x", "UNBRICK:OK\n")
+			var sum byte
+			for i := 0; i < len(payload); i++ {
+				sum += payload[i]
+			}
+			_, _ = fmt.Fprintf(unbrickSrv, "+$%s#%02x", payload, sum)
+		}
+	}()
+	out.Reset()
+	errBuf.Reset()
+	code = runWithEnv([]string{"recover", "--family", "ch32v003"}, cliEnv{
+		stdout:         &out,
+		stderr:         &errBuf,
+		discoverProbes: singleFakeProbe(),
+		ctrlTransceiver: func(_ usbprobe.ProbeDevice, _ []byte) ([]byte, error) {
+			return []byte{0x05, 0x02}, nil
+		},
+		portOpener: func(_ string) (io.ReadWriteCloser, error) {
+			return unbrickCli, nil
+		},
+	})
+	if code != 0 || !strings.Contains(out.String(), "NRST/POR catch-halt unbrick succeeded") {
+		t.Fatalf("expected Track A qRcmd,unbrick catch success, got code=%d out=%s stderr=%s", code, out.String(), errBuf.String())
+	}
+
 	// 3. STM32F1 connect_assert_srst mass erase with reset halt between unlock and mass_erase
 	runner := &fakeCommandRunner{
 		bins: map[string]string{"openocd": "/usr/bin/openocd"},
@@ -491,7 +523,7 @@ func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
 					t.Fatalf("expected embedded Zbit/ESP32 OpenOCD config and PID in %s:\n%s", ocdPath, string(ocdRaw))
 				}
 			}
-			if family == "esp32" || family == "esp32s3" {
+			if family == "esp32" || family == "esp32s3" || family == "ch32v003" {
 				preLaunch, ok := puCfg["preLaunchCommands"].([]any)
 				if !ok || len(preLaunch) == 0 || preLaunch[0] != "set remotetimeout 20" {
 					t.Fatalf("expected preLaunchCommands ['set remotetimeout 20'] for %s in launch.json, got %#v", family, puCfg["preLaunchCommands"])
@@ -502,8 +534,8 @@ func TestPUExportVSCodeGeneratesLaunchJSONAndOpenOCDCfg(t *testing.T) {
 				if !strings.HasPrefix(gdbTarget, "| ") || !strings.Contains(gdbTarget, "gdb-pipe --family ch32v003") || !strings.Contains(gdbTarget, "--pid 0x1050") {
 					t.Fatalf("expected stdio pipe gdbTarget with --pid in CH32 launch.json, got %q", gdbTarget)
 				}
-				if !strings.Contains(string(launchRaw), "set breakpoint auto-hw off") {
-					t.Fatalf("expected 'set breakpoint auto-hw off' in CH32 launch.json:\n%s", string(launchRaw))
+				if strings.Contains(string(launchRaw), "set breakpoint auto-hw off") {
+					t.Fatalf("did not expect 'set breakpoint auto-hw off' in CH32 launch.json (breaks GDB 10+ on flash):\n%s", string(launchRaw))
 				}
 			}
 		})
