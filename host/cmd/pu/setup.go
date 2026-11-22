@@ -334,7 +334,7 @@ func installSetup(ctx cliContext, tc *catalog.TargetsCatalog, lock *catalog.Depe
 			if err != nil {
 				return err
 			}
-			newProg, err := MergeManagedBlock(oldProg, renderProgrammersBody(family))
+			newProg, err := MergeManagedBlock(stripLegacyPrototypeBlocks(oldProg), renderProgrammersBody(family))
 			if err != nil {
 				return fmt.Errorf("%s: %w", progPath, err)
 			}
@@ -348,12 +348,27 @@ func installSetup(ctx cliContext, tc *catalog.TargetsCatalog, lock *catalog.Depe
 		if err != nil {
 			return err
 		}
-		newPlat, err := MergeManagedBlock(oldPlat, renderPlatformBody(family, puExe, opts.pid))
+		newPlat, err := MergeManagedBlock(stripLegacyPrototypeBlocks(oldPlat), renderPlatformBody(family, puExe, opts.pid))
 		if err != nil {
 			return fmt.Errorf("%s: %w", platPath, err)
 		}
 		if err := atomicWriteFile(platPath, []byte(newPlat), 0o644); err != nil {
 			return err
+		}
+
+		if boardsBody := renderBoardsBody(family); boardsBody != "" {
+			boardsPath := filepath.Join(hwDir, "boards.local.txt")
+			oldBoards, err := readOptionalNonSymlink(boardsPath)
+			if err != nil {
+				return err
+			}
+			newBoards, err := MergeManagedBlock(stripLegacyPrototypeBlocks(oldBoards), boardsBody)
+			if err != nil {
+				return fmt.Errorf("%s: %w", boardsPath, err)
+			}
+			if err := atomicWriteFile(boardsPath, []byte(newBoards), 0o644); err != nil {
+				return err
+			}
 		}
 
 		dbgPath := filepath.Join(hwDir, "debug_custom.json")
@@ -396,7 +411,7 @@ func uninstallSetup(ctx cliContext, tc *catalog.TargetsCatalog, opts setupOption
 			return err
 		}
 
-		for _, fn := range []string{"programmers.txt", "programmers.local.txt", "platform.local.txt"} {
+		for _, fn := range []string{"programmers.txt", "programmers.local.txt", "platform.local.txt", "boards.local.txt"} {
 			p := filepath.Join(hwDir, fn)
 			if _, statErr := os.Lstat(p); errors.Is(statErr, os.ErrNotExist) {
 				continue
@@ -695,6 +710,30 @@ func resolveSafeExecutablePath() (string, error) {
 	return clean, nil
 }
 
+func stripLegacyPrototypeBlocks(content string) string {
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	inLegacy := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !inLegacy && strings.HasPrefix(trimmed, "# BEGIN PICO UNIVERSAL") {
+			inLegacy = true
+			continue
+		}
+		if inLegacy {
+			if strings.HasPrefix(trimmed, "# END PICO UNIVERSAL") {
+				inLegacy = false
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	if inLegacy {
+		return content
+	}
+	return strings.Join(out, "\n")
+}
+
 func renderProgrammersBody(family string) string {
 	protocol := "cmsis-dap"
 	if family == "ch32v" {
@@ -718,11 +757,27 @@ func renderPlatformBody(family, puExeSlash string, pid uint16) string {
 	if family == "esp32" {
 		args += ` --segment "{build.bootloader_addr}:{build.path}/{build.project_name}.bootloader.bin" --segment "0x8000:{build.path}/{build.project_name}.partitions.bin" --segment "0xe000:{runtime.platform.path}/tools/partitions/boot_app0.bin" --segment "0x10000:{build.path}/{build.project_name}.bin"`
 	}
-	return strings.Join([]string{
+	lines := []string{
 		"tools.pico_universal.cmd=" + puExeSlash,
 		"tools.pico_universal.program.params.verbose=-v",
 		"tools.pico_universal.program.params.quiet=",
 		fmt.Sprintf(`tools.pico_universal.program.pattern="{tools.pico_universal.cmd}" %s {program.verbose}`, args),
+		"tools.pico_universal.upload.params.verbose=-v",
+		"tools.pico_universal.upload.params.quiet=",
+		fmt.Sprintf(`tools.pico_universal.upload.pattern="{tools.pico_universal.cmd}" %s {upload.verbose}`, args),
+	}
+	return strings.Join(lines, "\n")
+}
+
+func renderBoardsBody(family string) string {
+	if family != "ch32v" {
+		return ""
+	}
+	return strings.Join([]string{
+		"CH32V00x_EVT.menu.upload_method.pico_universal=Pico Universal (1-Wire SWIO)",
+		"CH32V00x_EVT.menu.upload_method.pico_universal.upload.protocol=swio-gdb",
+		"CH32V00x_EVT.menu.upload_method.pico_universal.upload.tool=pico_universal",
+		"CH32V00x_EVT.menu.upload_method.pico_universal.upload.tool.default=pico_universal",
 	}, "\n")
 }
 

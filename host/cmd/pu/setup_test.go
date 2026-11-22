@@ -907,3 +907,59 @@ func TestSetupLinuxRootReloadsUdevOnInstallAndUninstall(t *testing.T) {
 		t.Fatalf("unexpected udevadm uninstall commands: %+v", runner.ran)
 	}
 }
+
+func TestSetupStripsLegacyCustomerBlockAndAddsCH32UploadMethod(t *testing.T) {
+	arduinoDir := t.TempDir()
+	seedInstalledCores(t, arduinoDir)
+
+	ch32Dir := filepath.Join(arduinoDir, "packages", "WCH", "hardware", "ch32v", "1.0.4")
+	legacyProg := strings.Join([]string{
+		"# BEGIN PICO UNIVERSAL CUSTOMER ch32_swio",
+		"pico_universal_ch32_swio.name=Pico Universal [ch32_swio] CH32V003F4 (picorvd)",
+		"# END PICO UNIVERSAL CUSTOMER ch32_swio",
+		"custom_user.name=Keep User Programmer",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(ch32Dir, "programmers.txt"), []byte(legacyProg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errBuf bytes.Buffer
+	code := runWithEnv([]string{"setup", "--profiles-only", "--arduino-dir", arduinoDir, "--pid", "0x1050"}, cliEnv{
+		stdout: &out,
+		stderr: &errBuf,
+		getenv: func(string) string { return "" },
+		goos:   "darwin",
+	})
+	if code != 0 {
+		t.Fatalf("setup --profiles-only failed: %s", errBuf.String())
+	}
+
+	progRaw, err := os.ReadFile(filepath.Join(ch32Dir, "programmers.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(progRaw), "PICO UNIVERSAL CUSTOMER") || strings.Contains(string(progRaw), "pico_universal_ch32_swio") {
+		t.Fatalf("expected legacy prototype programmer block stripped, got:\n%s", string(progRaw))
+	}
+	if !strings.Contains(string(progRaw), "custom_user.name=Keep User Programmer") || !strings.Contains(string(progRaw), "pico_universal.name=Pico Universal") {
+		t.Fatalf("expected user programmer preserved and Pico Universal installed:\n%s", string(progRaw))
+	}
+
+	platRaw, err := os.ReadFile(filepath.Join(ch32Dir, "platform.local.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(platRaw), "tools.pico_universal.upload.pattern=") {
+		t.Fatalf("expected tools.pico_universal.upload.pattern in platform.local.txt:\n%s", string(platRaw))
+	}
+
+	boardsRaw, err := os.ReadFile(filepath.Join(ch32Dir, "boards.local.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(boardsRaw), "CH32V00x_EVT.menu.upload_method.pico_universal=") {
+		t.Fatalf("expected CH32V00x_EVT upload_method menu entry in boards.local.txt:\n%s", string(boardsRaw))
+	}
+}
+
